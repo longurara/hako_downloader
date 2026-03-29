@@ -1,13 +1,17 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const dns = require('dns');
+const express = require('express');
 const fs = require('fs-extra');
 const http = require('http');
 const https = require('https');
 const net = require('net');
 const path = require('path');
-const { terminal: term } = require('terminal-kit');
+const crypto = require('crypto');
 const EpubGen = require('epub-gen-memory').default;
+
+const app = express();
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -23,17 +27,12 @@ const SITE_ORIGINS = [
 ];
 
 const DNS_PROFILES = {
-  system: { id: 'system', label: 'He thong mac dinh', servers: null },
+  system: { id: 'system', label: 'Hệ thống mặc định', servers: null },
   cloudflare: { id: 'cloudflare', label: 'Cloudflare (1.1.1.1, 1.0.0.1)', servers: ['1.1.1.1', '1.0.0.1'] },
   google: { id: 'google', label: 'Google (8.8.8.8, 8.8.4.4)', servers: ['8.8.8.8', '8.8.4.4'] }
 };
 
-const EPUB_MODES = [
-  { id: '0', label: 'Chi tai TXT, khong tao EPUB' },
-  { id: '1', label: '1 file EPUB cho tat ca tap' },
-  { id: '2', label: '1 file EPUB cho moi tap' },
-  { id: '3', label: 'Ca 2 kieu EPUB' }
-];
+const EPUB_MODES = ['0', '1', '2', '3'];
 
 const NAV_TEXT_BLACKLIST = new Set([
   '',
@@ -56,10 +55,14 @@ const NAV_TEXT_BLACKLIST = new Set([
 let activeOrigin = SITE_ORIGINS[0];
 let dnsProfile = createDnsProfile(DNS_PROFILES.system.label, DNS_PROFILES.system.servers, DNS_PROFILES.system.id);
 let httpClient;
-let terminalImageModulePromise;
-let terminalGraphicsSupportPromise;
+
+const tasks = new Map();
 
 applyDnsProfile(DNS_PROFILES.system);
+
+app.use(express.json({ limit: '1mb' }));
+app.use('/downloads', express.static(DOWNLOADS_DIR));
+app.use(express.static(path.join(__dirname, 'public')));
 
 function createDnsProfile(label, servers, id = 'custom') {
   return {
@@ -88,10 +91,18 @@ function normalizeSearchText(value) {
     .toLowerCase();
 }
 
-function truncate(value, width) {
-  if (!value || value.length <= width) return value;
-  if (width <= 3) return value.slice(0, width);
-  return `${value.slice(0, width - 3)}...`;
+function toDownloadUrl(filePath) {
+  const relativePath = path.relative(DOWNLOADS_DIR, filePath);
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return null;
+  }
+
+  const encodedPath = relativePath
+    .split(path.sep)
+    .map(segment => encodeURIComponent(segment))
+    .join('/');
+
+  return `/downloads/${encodedPath}`;
 }
 
 function isNovelPath(pathname) {
@@ -180,9 +191,9 @@ function collectErrorMessages(error, messages = [], seen = new Set()) {
 
 function formatErrorMessage(error) {
   const messages = collectErrorMessages(error);
-  if (messages.length === 0) return 'Loi khong xac dinh';
+  if (messages.length === 0) return 'Lỗi không xác định';
   if (messages.length === 1) return messages[0];
-  return messages.slice(0, 4).join('\n- ');
+  return messages.slice(0, 5).join(' | ');
 }
 
 function isNoDataError(error) {
@@ -293,12 +304,11 @@ function applyDnsProfile(profile) {
   httpClient = createHttpClient(lookup);
 }
 
-function getDnsStatusLabel() {
-  return dnsProfile.label;
-}
-
-function getStatusLine() {
-  return `Site: ${activeOrigin} | DNS: ${getDnsStatusLabel()}`;
+function getStatus() {
+  return {
+    site: activeOrigin,
+    dns: dnsProfile.label
+  };
 }
 
 function extractAnchorTitle($, anchor) {
@@ -362,14 +372,9 @@ function extractNovelCandidatesFromHtml(html, pageUrl) {
     const title = extractAnchorTitle($, anchor);
     const imageUrl = extractAnchorImage($, anchor, pageUrl);
     const url = normalizeNovelUrl(href, pageUrl);
-
     if (!url) return;
 
-    items.push({
-      title,
-      imageUrl,
-      url
-    });
+    items.push({ title, imageUrl, url });
   });
 
   return aggregateNovelItems(items);
@@ -423,32 +428,14 @@ async function fetchHtmlPage(pathOrUrl) {
       if (isSiteOrigin(finalOrigin)) {
         activeOrigin = finalOrigin;
       }
-      return {
-        url: finalUrl,
-        html
-      };
+
+      return { url: finalUrl, html };
     } catch (error) {
       lastError = error;
     }
   }
 
-  throw lastError || new Error(`Khong the tai trang: ${pathOrUrl}`);
-}
-
-async function fetchBinary(pathOrUrl) {
-  const candidates = buildCandidateUrls(pathOrUrl);
-  let lastError = null;
-
-  for (const candidateUrl of candidates) {
-    try {
-      const response = await httpClient.get(candidateUrl, { responseType: 'arraybuffer' });
-      return Buffer.from(response.data);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error(`Khong the tai file: ${pathOrUrl}`);
+  throw lastError || new Error(`Không thể tải trang: ${pathOrUrl}`);
 }
 
 async function fetchHomepageRecommendations() {
@@ -458,7 +445,7 @@ async function fetchHomepageRecommendations() {
     .slice(0, 40);
 
   if (novels.length === 0) {
-    throw new Error('Khong tim thay truyen nao tren trang chu.');
+    throw new Error('Không tìm thấy truyện nào trên trang chủ.');
   }
 
   return novels;
@@ -483,7 +470,7 @@ async function searchNovels(keyword) {
 
       if (results.length > 0) return results;
     } catch {
-      // Try the next candidate endpoint.
+      // Try the next endpoint.
     }
   }
 
@@ -606,11 +593,11 @@ async function fetchNovelInfo(url) {
   const title = normalizeWhitespace($('.series-name a').first().text())
     || normalizeWhitespace($('h1').first().text())
     || normalizeWhitespace($('title').text().replace(/\s*-\s*Cổng Light Novel.*$/i, ''))
-    || 'Chua ro tieu de';
+    || 'Chưa rõ tiêu đề';
 
   const volumes = extractVolumes($, page.url);
   if (volumes.length === 0) {
-    throw new Error('Khong doc duoc danh sach tap/chuong cua truyen nay.');
+    throw new Error('Không đọc được danh sách tập/chương của truyện này.');
   }
 
   return {
@@ -667,7 +654,7 @@ async function generateEpub(epubPath, title, author, coverUrl, chapters) {
     title,
     author,
     publisher: 'Hako Downloader',
-    tocTitle: 'Muc luc',
+    tocTitle: 'Mục lục',
     ignoreFailedDownloads: true
   };
 
@@ -676,10 +663,7 @@ async function generateEpub(epubPath, title, author, coverUrl, chapters) {
   try {
     const buffer = await EpubGen(options, chapters);
     await fs.writeFile(epubPath, buffer);
-    console.log(`[EPUB] ${epubPath}`);
   } catch (error) {
-    console.log(`[CANH BAO] Loi anh bia: ${error.message}. Thu lai khong kem anh...`);
-
     for (const chapter of chapters) {
       const $chapter = cheerio.load(chapter.content);
       $chapter('img').remove();
@@ -689,16 +673,14 @@ async function generateEpub(epubPath, title, author, coverUrl, chapters) {
     delete options.cover;
     const buffer = await EpubGen(options, chapters);
     await fs.writeFile(epubPath, buffer);
-    console.log(`[EPUB] ${epubPath} (khong kem anh)`);
   }
 }
 
-async function downloadChapters(volume, volumeDir, author) {
+async function downloadChapters(volume, volumeDir, author, handlers = {}) {
   const epubChapters = [];
 
   for (const [index, chapter] of volume.chapters.entries()) {
-    const prefix = `[${index + 1}/${volume.chapters.length}]`;
-    process.stdout.write(`${prefix} ${chapter.title} `);
+    handlers.onChapterStart?.(chapter, index, volume.chapters.length);
 
     const safeChapterTitle = sanitizeFileName(chapter.title);
     const txtPath = path.join(volumeDir, `${safeChapterTitle}.txt`);
@@ -707,8 +689,8 @@ async function downloadChapters(volume, volumeDir, author) {
     let contentHtml = '';
 
     if (fs.existsSync(htmlPath) && fs.existsSync(txtPath)) {
-      console.log('(cache)');
       contentHtml = await fs.readFile(htmlPath, 'utf-8');
+      handlers.onLog?.(`[cache] ${chapter.title}`);
     } else {
       try {
         const chapterResponse = await httpClient.get(chapter.url);
@@ -731,7 +713,7 @@ async function downloadChapters(volume, volumeDir, author) {
 
         contentHtml = $chapter('#chapter-content').html();
         if (!contentHtml) {
-          console.log('(trong)');
+          handlers.onLog?.(`[bỏ qua] ${chapter.title} (rỗng)`);
           continue;
         }
 
@@ -739,7 +721,7 @@ async function downloadChapters(volume, volumeDir, author) {
         $chapter('#chapter-content > p').each((_, paragraph) => {
           const imageUrl = $chapter(paragraph).find('img').attr('src');
           if (imageUrl) {
-            textContent += `[Anh: ${imageUrl}]\n\n`;
+            textContent += `[Ảnh: ${imageUrl}]\n\n`;
             return;
           }
 
@@ -749,9 +731,9 @@ async function downloadChapters(volume, volumeDir, author) {
 
         await fs.writeFile(txtPath, textContent, 'utf-8');
         await fs.writeFile(htmlPath, contentHtml, 'utf-8');
-        console.log('OK');
+        handlers.onLog?.(`[ok] ${chapter.title}`);
       } catch (error) {
-        console.log(`LOI: ${error.message}`);
+        handlers.onLog?.(`[lỗi] ${chapter.title}: ${error.message}`);
         if (error.response && error.response.status === 429) {
           await delay(10000);
         }
@@ -766,214 +748,129 @@ async function downloadChapters(volume, volumeDir, author) {
       author,
       content: contentHtml
     });
+
+    handlers.onChapterDone?.(chapter, index, volume.chapters.length);
   }
 
   return epubChapters;
 }
 
-function enableInteractiveMode() {
-  term.grabInput({ mouse: 'button' });
-  term.hideCursor();
+function createTask(payload) {
+  const task = {
+    id: crypto.randomUUID(),
+    status: 'queued',
+    progress: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    logs: [],
+    payload
+  };
+
+  tasks.set(task.id, task);
+  return task;
 }
 
-function disableInteractiveMode() {
-  term.hideCursor(false);
-  term.grabInput(false);
+function getTask(taskId) {
+  return tasks.get(taskId);
 }
 
-function cleanupTerminal() {
-  disableInteractiveMode();
-  term.styleReset();
+function updateTask(taskId, patch) {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+
+  Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+  return task;
 }
 
-function renderHeader(title, subtitle = '') {
-  term.clear();
-  term.bold.cyan('HAKO DOWNLOADER CLI\n');
-  term.dim(`${getStatusLine()}\n`);
-  if (title) term.bold.white(`${title}\n`);
-  if (subtitle) term.gray(`${subtitle}\n`);
-  term('\n');
-}
+function pushTaskLog(taskId, message) {
+  const task = tasks.get(taskId);
+  if (!task) return;
 
-async function waitForKey(message = 'Nhan phim bat ky de tiep tuc...') {
-  term.dim(`\n${message}`);
-  await new Promise(resolve => term.once('key', resolve));
-}
-
-async function promptText(title, prompt, options = {}) {
-  if (!options.inline) {
-    renderHeader(title, options.subtitle || '');
-  }
-  term.white(`${prompt} `);
-
-  const controller = term.inputField({
-    cancelable: true,
-    default: options.default || '',
-    history: options.history || []
+  task.logs.push({
+    at: new Date().toISOString(),
+    message
   });
 
-  const value = await controller.promise;
-  term('\n');
-  return normalizeWhitespace(value);
+  if (task.logs.length > 200) {
+    task.logs.splice(0, task.logs.length - 200);
+  }
+
+  task.updatedAt = new Date().toISOString();
+  console.log(`[task:${taskId}] ${message}`);
 }
 
-function createMenuItems(items, labelSelector) {
-  return items.map((item, index) => {
-    const label = typeof labelSelector === 'function' ? labelSelector(item, index) : String(item);
-    return truncate(label, Math.max(20, term.width - 8));
+function serializeTask(task) {
+  if (!task) return null;
+
+  return {
+    id: task.id,
+    status: task.status,
+    progress: task.progress,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    error: task.error,
+    result: task.result,
+    payload: task.payload,
+    logs: task.logs
+  };
+}
+
+function ensureValidEpubMode(epubMode) {
+  return EPUB_MODES.includes(epubMode) ? epubMode : '1';
+}
+
+function resolveSelectedVolumeIndexes(volumes, selectedVolumeIndexes) {
+  if (!Array.isArray(selectedVolumeIndexes) || selectedVolumeIndexes.length === 0) {
+    return volumes.map((_, index) => index);
+  }
+
+  const indexes = selectedVolumeIndexes
+    .map(value => Number.parseInt(value, 10))
+    .filter(index => Number.isInteger(index) && index >= 0 && index < volumes.length);
+
+  return [...new Set(indexes)];
+}
+
+async function performDownload(taskId, payload) {
+  updateTask(taskId, {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    progress: 2
   });
-}
 
-async function chooseFromMenu(title, subtitle, items, options = {}) {
-  if (!options.inline) {
-    renderHeader(title, subtitle);
+  pushTaskLog(taskId, 'Đang lấy thông tin truyện...');
+
+  const novel = await fetchNovelInfo(payload.url);
+  const selectedVolumeIndexes = resolveSelectedVolumeIndexes(novel.volumes, payload.selectedVolumeIndexes);
+  const epubMode = ensureValidEpubMode(payload.epubMode);
+
+  if (selectedVolumeIndexes.length === 0) {
+    throw new Error('Không có tập hợp lệ để tải.');
   }
 
-  const labels = createMenuItems(items, options.labelSelector);
-  const menuController = term.singleColumnMenu(labels, {
-    cancelable: true,
-    oneLineItem: true,
-    selectedIndex: options.selectedIndex || 0,
-    selectedStyle: term.black.bgCyan,
-    selectedLeftPadding: ' > ',
-    leftPadding: '   ',
-    itemMaxWidth: Math.max(24, term.width - 4)
-  });
-
-  const response = await menuController.promise;
-  if (!response || response.canceled) return null;
-  return items[response.selectedIndex];
-}
-
-async function showLoadingScreen(title, message) {
-  renderHeader(title, message);
-  await delay(80);
-}
-
-async function showErrorScreen(title, error) {
-  renderHeader(title, 'Co loi xay ra');
-  term.red(`${formatErrorMessage(error)}\n`);
-  await waitForKey();
-}
-
-async function getTerminalImage() {
-  if (!terminalImageModulePromise) {
-    terminalImageModulePromise = import('terminal-image').then(module => module.default || module);
-  }
-
-  return terminalImageModulePromise;
-}
-
-async function getTerminalGraphicsSupport() {
-  if (!terminalGraphicsSupportPromise) {
-    terminalGraphicsSupportPromise = import('supports-terminal-graphics')
-      .then(module => (module.default || module).stdout || { kitty: false, iterm2: false, sixel: false })
-      .catch(() => ({ kitty: false, iterm2: false, sixel: false }));
-  }
-
-  return terminalGraphicsSupportPromise;
-}
-
-async function renderCoverImage(coverUrl, options = {}) {
-  if (!coverUrl) return;
-
-  try {
-    const imageBuffer = await fetchBinary(coverUrl);
-    const terminalImage = await getTerminalImage();
-    const graphicsSupport = await getTerminalGraphicsSupport();
-    const hasNativeSupport = Boolean(graphicsSupport.kitty || graphicsSupport.iterm2 || graphicsSupport.sixel);
-    const mode = options.mode || 'preview';
-    const width = mode === 'full'
-      ? (hasNativeSupport ? '55%' : '85%')
-      : (hasNativeSupport ? '35%' : '55%');
-    const preview = await terminalImage.buffer(imageBuffer, {
-      width,
-      preserveAspectRatio: true,
-      preferNativeRender: true
-    });
-
-    if (!hasNativeSupport) {
-      term.dim('[Terminal hien tai khong ho tro anh native, nen preview duoi day la dang block mau.]\n');
+  updateTask(taskId, {
+    payload: {
+      ...payload,
+      selectedVolumeIndexes,
+      epubMode,
+      novelTitle: novel.title
     }
-
-    term(`${preview}\n`);
-  } catch {
-    term.dim('[Khong render duoc anh bia trong terminal]\n');
-  }
-}
-
-function renderVolumePreview(volumes) {
-  term.bold('Danh sach tap:\n');
-  const previewVolumes = volumes.slice(0, 12);
-
-  previewVolumes.forEach((volume, index) => {
-    term(` ${index + 1}. ${volume.title} (${volume.chapters.length} chuong)\n`);
   });
 
-  if (volumes.length > previewVolumes.length) {
-    term.dim(` ... va con ${volumes.length - previewVolumes.length} tap nua\n`);
-  }
-}
-
-async function chooseEpubMode() {
-  const selected = await chooseFromMenu(
-    'Che do EPUB',
-    'Ban co the click chuot de chon',
-    EPUB_MODES,
-    { labelSelector: item => item.label }
+  const totalChapters = selectedVolumeIndexes.reduce(
+    (sum, volumeIndex) => sum + novel.volumes[volumeIndex].chapters.length,
+    0
   );
-
-  return selected ? selected.id : null;
-}
-
-async function chooseVolumeIndexes(novel) {
-  const mode = await chooseFromMenu(
-    'Chon pham vi tai',
-    'Tai tat ca hoac nhap so tap can tai',
-    [
-      { id: 'all', label: 'Tai tat ca tap' },
-      { id: 'custom', label: 'Tu nhap so tap (vi du: 1,3,5)' },
-      { id: 'back', label: 'Quay lai' }
-    ],
-    { labelSelector: item => item.label }
-  );
-
-  if (!mode || mode.id === 'back') return null;
-  if (mode.id === 'all') return novel.volumes.map((_, index) => index);
-
-  renderHeader('Nhap tap can tai', 'Nhap 0 de tai tat ca, hoac 1,3,5 de chon nhieu tap');
-  renderVolumePreview(novel.volumes);
-  term('\n');
-
-  const raw = await promptText('Nhap tap can tai', 'Lua chon:', {
-    subtitle: 'Nhap 0 de tai tat ca, hoac 1,3,5 de chon nhieu tap',
-    inline: true
-  });
-
-  if (!raw) return null;
-  if (raw === '0') return novel.volumes.map((_, index) => index);
-
-  const indexes = raw
-    .split(',')
-    .map(part => parseInt(part.trim(), 10) - 1)
-    .filter(index => Number.isInteger(index) && index >= 0 && index < novel.volumes.length);
-
-  return indexes.length > 0 ? [...new Set(indexes)] : null;
-}
-
-async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
-  disableInteractiveMode();
-  console.clear();
-  console.log('=== BAT DAU TAI ===');
-  console.log(`Truyen: ${novel.title}`);
-  console.log(`Tac gia: ${novel.author}`);
-  console.log(`Nguon: ${novel.sourceUrl}`);
-  console.log('');
 
   const safeTitle = sanitizeFileName(novel.title);
-  const novelDir = path.join(__dirname, 'downloads', safeTitle);
+  const novelDir = path.join(DOWNLOADS_DIR, safeTitle);
   await fs.ensureDir(novelDir);
 
+  pushTaskLog(taskId, `Bắt đầu tải: ${novel.title}`);
+
+  let processedChapters = 0;
   const allEpubChapters = [];
   const perVolumeChapters = {};
 
@@ -983,8 +880,27 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
     const volumeDir = path.join(novelDir, safeVolumeTitle);
     await fs.ensureDir(volumeDir);
 
-    console.log(`\n--- ${volume.title} ---`);
-    const chapters = await downloadChapters(volume, volumeDir, novel.author);
+    pushTaskLog(taskId, `Đang xử lý ${volume.title}`);
+
+    const chapters = await downloadChapters(volume, volumeDir, novel.author, {
+      onChapterStart: (chapter, chapterIndex, volumeChapterCount) => {
+        pushTaskLog(
+          taskId,
+          `Chương ${chapterIndex + 1}/${volumeChapterCount}: ${chapter.title}`
+        );
+      },
+      onChapterDone: () => {
+        processedChapters += 1;
+        const progress = totalChapters > 0
+          ? Math.min(92, 8 + Math.round((processedChapters / totalChapters) * 80))
+          : 50;
+        updateTask(taskId, { progress });
+      },
+      onLog: message => {
+        pushTaskLog(taskId, message);
+      }
+    });
+
     allEpubChapters.push(...chapters);
     perVolumeChapters[volumeIndex] = {
       safeVolumeTitle,
@@ -992,9 +908,13 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
     };
   }
 
+  const generatedEpubs = [];
+
   if (epubMode === '1' || epubMode === '3') {
-    const epubPath = path.join(__dirname, 'downloads', `${safeTitle}.epub`);
+    const epubPath = path.join(DOWNLOADS_DIR, `${safeTitle}.epub`);
+    pushTaskLog(taskId, 'Đang đóng gói EPUB tổng...');
     await generateEpub(epubPath, novel.title, novel.author, novel.coverUrl, [...allEpubChapters]);
+    generatedEpubs.push(epubPath);
   }
 
   if (epubMode === '2' || epubMode === '3') {
@@ -1002,7 +922,8 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
       const record = perVolumeChapters[volumeIndex];
       if (!record || record.chapters.length === 0) continue;
 
-      const epubPath = path.join(__dirname, 'downloads', `${safeTitle} - ${record.safeVolumeTitle}.epub`);
+      const epubPath = path.join(DOWNLOADS_DIR, `${safeTitle} - ${record.safeVolumeTitle}.epub`);
+      pushTaskLog(taskId, `Đang đóng gói EPUB ${record.safeVolumeTitle}...`);
       await generateEpub(
         epubPath,
         `${novel.title} - ${novel.volumes[volumeIndex].title}`,
@@ -1010,242 +931,164 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
         novel.coverUrl,
         [...record.chapters]
       );
+      generatedEpubs.push(epubPath);
     }
   }
 
-  console.log('\n=== HOAN TAT ===');
-  console.log(`TXT: ${novelDir}`);
-  if (epubMode !== '0') {
-    console.log(`EPUB: ${path.join(__dirname, 'downloads')}`);
-  }
+  updateTask(taskId, {
+        status: 'completed',
+        progress: 100,
+        finishedAt: new Date().toISOString(),
+        result: {
+          novelTitle: novel.title,
+          novelDir,
+          epubFiles: generatedEpubs,
+          epubItems: generatedEpubs.map(filePath => ({
+            name: path.basename(filePath),
+            path: filePath,
+            url: toDownloadUrl(filePath)
+          })),
+          sourceUrl: novel.sourceUrl
+        }
+      });
 
-  console.log('');
-  console.log('Nhan Enter de quay lai...');
-  process.stdin.resume();
-  await new Promise(resolve => process.stdin.once('data', resolve));
-  enableInteractiveMode();
+  pushTaskLog(taskId, 'Hoàn tất.');
 }
 
-async function showNovelDetailScreen(novel) {
-  renderHeader('Chi tiet truyen', 'Click vao hanh dong muon thuc hien');
+function startDownloadTask(payload) {
+  const task = createTask(payload);
 
-  await renderCoverImage(novel.coverUrl, { mode: 'preview' });
-
-  term.bold.white(`${novel.title}\n`);
-  term(`Tac gia: ${novel.author}\n`);
-  term(`So tap: ${novel.volumes.length}\n`);
-  term(`Nguon: ${novel.sourceUrl}\n\n`);
-
-  if (novel.summary) {
-    term(`${truncate(novel.summary, Math.max(120, term.width * 3))}\n\n`);
-  }
-
-  renderVolumePreview(novel.volumes);
-  term('\n');
-
-  const action = await chooseFromMenu(
-    'Chi tiet truyen',
-    'Ban co the tai ngay, chon tap, hoac quay lai',
-    [
-      { id: 'download_all', label: 'Tai tat ca tap' },
-      { id: 'choose_volumes', label: 'Chon tap can tai' },
-      { id: 'show_cover', label: 'Xem lai anh bia' },
-      { id: 'back', label: 'Quay lai' }
-    ],
-    { labelSelector: item => item.label, inline: true }
-  );
-
-  if (!action || action.id === 'back') return;
-
-  if (action.id === 'show_cover') {
-    renderHeader('Anh bia', novel.title);
-    await renderCoverImage(novel.coverUrl, { mode: 'full' });
-    await waitForKey();
-    await showNovelDetailScreen(novel);
-    return;
-  }
-
-  const epubMode = await chooseEpubMode();
-  if (!epubMode) {
-    await showNovelDetailScreen(novel);
-    return;
-  }
-
-  const selectedVolumeIndexes = action.id === 'download_all'
-    ? novel.volumes.map((_, index) => index)
-    : await chooseVolumeIndexes(novel);
-
-  if (!selectedVolumeIndexes || selectedVolumeIndexes.length === 0) {
-    renderHeader('Khong co tap nao duoc chon', 'Quay lai man hinh chi tiet');
-    term.yellow('Ban chua chon tap hop le.\n');
-    await waitForKey();
-    await showNovelDetailScreen(novel);
-    return;
-  }
-
-  await runDownloadFlow(novel, selectedVolumeIndexes, epubMode);
-}
-
-async function selectNovelFromList(title, subtitle, novels) {
-  const items = novels.map((novel, index) => ({
-    ...novel,
-    displayLabel: `${index + 1}. ${novel.title}`
-  }));
-
-  const choice = await chooseFromMenu(title, subtitle, items, {
-    labelSelector: item => item.displayLabel
+  performDownload(task.id, payload).catch(error => {
+    updateTask(task.id, {
+      status: 'failed',
+      finishedAt: new Date().toISOString(),
+      error: formatErrorMessage(error)
+    });
+    pushTaskLog(task.id, `Thất bại: ${formatErrorMessage(error)}`);
   });
 
-  return choice || null;
+  return task;
 }
 
-async function searchFlow() {
-  const keyword = await promptText('Tim truyen', 'Nhap tu khoa:');
-  if (!keyword) return;
+function parseSelectedVolumeIndexes(body) {
+  if (!Array.isArray(body.selectedVolumeIndexes)) return [];
+  return body.selectedVolumeIndexes.map(value => Number.parseInt(value, 10));
+}
 
-  await showLoadingScreen('Tim truyen', `Dang tim theo tu khoa: ${keyword}`);
+app.get('/api/status', (req, res) => {
+  res.json(getStatus());
+});
 
-  const results = await searchNovels(keyword);
-  if (!results || results.length === 0) {
-    renderHeader('Tim truyen', 'Khong co ket qua phu hop');
-    term.yellow(`Khong tim thay truyen nao khop voi "${keyword}".\n`);
-    await waitForKey();
+app.get('/api/dns-profiles', (req, res) => {
+  res.json({
+    current: dnsProfile,
+    profiles: Object.values(DNS_PROFILES)
+  });
+});
+
+app.post('/api/dns', (req, res) => {
+  const { profileId, servers } = req.body || {};
+
+  if (profileId && DNS_PROFILES[profileId]) {
+    applyDnsProfile(DNS_PROFILES[profileId]);
+    res.json({ ok: true, current: dnsProfile });
     return;
   }
 
-  const selectedNovel = await selectNovelFromList(
-    'Ket qua tim kiem',
-    'Click vao truyen muon xem',
-    results
-  );
+  if (profileId === 'custom') {
+    const normalizedServers = Array.isArray(servers) ? servers.map(item => String(item).trim()).filter(Boolean) : [];
+    const invalidServers = normalizedServers.filter(server => net.isIP(server) === 0);
 
-  if (!selectedNovel) return;
-
-  await showLoadingScreen('Dang lay thong tin truyen', selectedNovel.title);
-  const novel = await fetchNovelInfo(selectedNovel.url);
-  await showNovelDetailScreen(novel);
-}
-
-async function homepageFlow() {
-  await showLoadingScreen('Goi y tu trang chu', 'Dang crawl danh sach de ban chon...');
-  const novels = await fetchHomepageRecommendations();
-
-  const selectedNovel = await selectNovelFromList(
-    'Goi y tu trang chu',
-    'Danh sach nay duoc gom tu nhung truyen dang xuat hien tren trang chu',
-    novels
-  );
-
-  if (!selectedNovel) return;
-
-  await showLoadingScreen('Dang lay thong tin truyen', selectedNovel.title);
-  const novel = await fetchNovelInfo(selectedNovel.url);
-  await showNovelDetailScreen(novel);
-}
-
-async function directUrlFlow() {
-  const url = await promptText('Nhap URL truyen', 'Link truyen:');
-  if (!url) return;
-
-  await showLoadingScreen('Dang lay thong tin truyen', url);
-  const novel = await fetchNovelInfo(url);
-  await showNovelDetailScreen(novel);
-}
-
-async function configureDnsFlow() {
-  const choice = await chooseFromMenu(
-    'Cau hinh DNS',
-    'Ap dung cho phien chay hien tai cua app',
-    [
-      DNS_PROFILES.system,
-      DNS_PROFILES.cloudflare,
-      DNS_PROFILES.google,
-      { id: 'custom', label: 'Tu nhap DNS (vi du: 1.1.1.1, 8.8.8.8)' },
-      { id: 'back', label: 'Quay lai' }
-    ],
-    { labelSelector: item => item.label }
-  );
-
-  if (!choice || choice.id === 'back') return;
-
-  if (choice.id !== 'custom') {
-    applyDnsProfile(choice);
-    renderHeader('Cau hinh DNS', 'Da cap nhat cau hinh');
-    term.green(`Dang dung: ${getDnsStatusLabel()}\n`);
-    await waitForKey();
-    return;
-  }
-
-  const rawServers = await promptText(
-    'Tu nhap DNS',
-    'Nhap DNS cach nhau boi dau phay:',
-    { subtitle: 'Vi du: 1.1.1.1, 1.0.0.1' }
-  );
-
-  if (!rawServers) return;
-
-  const servers = rawServers.split(',').map(item => item.trim()).filter(Boolean);
-  const invalidServers = servers.filter(server => net.isIP(server) === 0);
-
-  if (servers.length === 0 || invalidServers.length > 0) {
-    renderHeader('Tu nhap DNS', 'Gia tri khong hop le');
-    term.red(`DNS loi: ${invalidServers.join(', ') || 'trong'}\n`);
-    await waitForKey();
-    return;
-  }
-
-  applyDnsProfile(createDnsProfile(`Tu nhap (${servers.join(', ')})`, servers));
-  renderHeader('Cau hinh DNS', 'Da cap nhat cau hinh');
-  term.green(`Dang dung: ${getDnsStatusLabel()}\n`);
-  await waitForKey();
-}
-
-async function mainMenuLoop() {
-  while (true) {
-    const action = await chooseFromMenu(
-      'Menu chinh',
-      'Click chuot de chon, khong can dung phim mui ten',
-      [
-        { id: 'homepage', label: 'Goi y tu trang chu' },
-        { id: 'search', label: 'Tim truyen theo tu khoa' },
-        { id: 'url', label: 'Nhap URL truyen truc tiep' },
-        { id: 'dns', label: 'Cau hinh DNS' },
-        { id: 'exit', label: 'Thoat' }
-      ],
-      { labelSelector: item => item.label }
-    );
-
-    if (!action || action.id === 'exit') return;
-
-    try {
-      if (action.id === 'homepage') await homepageFlow();
-      if (action.id === 'search') await searchFlow();
-      if (action.id === 'url') await directUrlFlow();
-      if (action.id === 'dns') await configureDnsFlow();
-    } catch (error) {
-      await showErrorScreen('Co loi xay ra', error);
+    if (normalizedServers.length === 0 || invalidServers.length > 0) {
+      res.status(400).json({ error: `DNS không hợp lệ: ${invalidServers.join(', ') || 'trống'}` });
+      return;
     }
+
+    applyDnsProfile(createDnsProfile(`Tự nhập (${normalizedServers.join(', ')})`, normalizedServers));
+    res.json({ ok: true, current: dnsProfile });
+    return;
   }
-}
 
-async function main() {
-  enableInteractiveMode();
+  res.status(400).json({ error: 'Không nhận diện được cấu hình DNS.' });
+});
 
-  process.on('SIGINT', () => {
-    cleanupTerminal();
-    process.exit(0);
-  });
+app.get('/api/recommendations', async (req, res) => {
+  try {
+    const items = await fetchHomepageRecommendations();
+    res.json({ items, status: getStatus() });
+  } catch (error) {
+    res.status(500).json({ error: formatErrorMessage(error) });
+  }
+});
+
+app.get('/api/search', async (req, res) => {
+  const query = normalizeWhitespace(req.query.q || '');
+  if (!query) {
+    res.status(400).json({ error: 'Từ khóa tìm kiếm không được để trống.' });
+    return;
+  }
 
   try {
-    await mainMenuLoop();
-  } finally {
-    cleanupTerminal();
-    term('\nTam biet!\n');
+    const items = await searchNovels(query);
+    res.json({ items, query, status: getStatus() });
+  } catch (error) {
+    res.status(500).json({ error: formatErrorMessage(error) });
   }
-}
+});
 
-main().catch(error => {
-  cleanupTerminal();
-  console.error(error);
-  process.exit(1);
+app.get('/api/novel', async (req, res) => {
+  const url = normalizeWhitespace(req.query.url || '');
+  if (!url) {
+    res.status(400).json({ error: 'Thiếu URL truyện.' });
+    return;
+  }
+
+  try {
+    const novel = await fetchNovelInfo(url);
+    res.json({ novel, status: getStatus() });
+  } catch (error) {
+    res.status(500).json({ error: formatErrorMessage(error) });
+  }
+});
+
+app.post('/api/download', (req, res) => {
+  const url = normalizeWhitespace(req.body?.url || '');
+  if (!url) {
+    res.status(400).json({ error: 'Thiếu URL truyện.' });
+    return;
+  }
+
+  const task = startDownloadTask({
+    url,
+    epubMode: ensureValidEpubMode(String(req.body?.epubMode || '1')),
+    selectedVolumeIndexes: parseSelectedVolumeIndexes(req.body || {})
+  });
+
+  res.status(202).json({ task: serializeTask(task) });
+});
+
+app.get('/api/tasks/:taskId', (req, res) => {
+  const task = getTask(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: 'Không tìm thấy task.' });
+    return;
+  }
+
+  res.json({ task: serializeTask(task) });
+});
+
+app.get('/api/tasks', (req, res) => {
+  res.json({
+    tasks: [...tasks.values()].map(serializeTask)
+  });
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+const port = Number.parseInt(process.env.PORT || '3000', 10);
+
+app.listen(port, () => {
+  console.log(`HAKO web server đang chạy tại http://localhost:${port}`);
 });

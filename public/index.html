@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hako Downloader Web</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar card">
+      <div class="brand-block">
+        <p class="eyebrow">Hako Downloader</p>
+        <h1>Hako Downloader</h1>
+        <p class="lead">Web console để tìm truyện, xem chi tiết và tải EPUB ngay trong Chrome.</p>
+      </div>
+
+      <div class="topbar-side">
+        <button id="loadRecommendationsBtn" class="primary-button" type="button">Làm Mới Gợi Ý</button>
+        <div class="status-strip">
+          <span id="siteStatus" class="status-chip">Site: ...</span>
+          <span id="dnsStatus" class="status-chip">DNS: ...</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar card">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Thư Viện</h2>
+              <p>Tìm bằng từ khóa hoặc dán URL truyện trực tiếp.</p>
+            </div>
+          </div>
+
+          <form id="searchForm" class="search-form">
+            <input id="searchInput" type="text" placeholder="Tìm truyện theo từ khóa...">
+            <button type="submit">Tìm</button>
+          </form>
+
+          <form id="directUrlForm" class="direct-form">
+            <input id="directUrlInput" type="url" placeholder="Dán URL truyện...">
+            <button type="submit" class="ghost-button">Mở URL</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h3>DNS</h3>
+              <p>Chỉ áp dụng cho phiên hiện tại.</p>
+            </div>
+          </div>
+
+          <div class="dns-box">
+            <label for="dnsSelect">Cấu hình</label>
+            <select id="dnsSelect"></select>
+            <input id="customDnsInput" type="text" placeholder="1.1.1.1, 1.0.0.1">
+            <button id="applyDnsBtn" type="button" class="ghost-button">Áp Dụng DNS</button>
+          </div>
+        </section>
+
+        <div class="results-head">
+          <h3 id="resultsTitle">Gợi Ý Từ Trang Chủ</h3>
+          <span id="resultsCount" class="count-pill"></span>
+        </div>
+
+        <div id="resultsList" class="results-list"></div>
+      </aside>
+
+      <section class="content">
+        <article class="detail card">
+          <div id="detailEmpty" class="empty-state">
+            <span class="empty-badge">Sẵn sàng</span>
+            <h2>Chọn một truyện để bắt đầu</h2>
+            <p>Kết quả tìm kiếm sẽ hiện chi tiết, tóm tắt và danh sách tập tại đây.</p>
+          </div>
+
+          <div id="detailView" class="detail-view hidden">
+            <div class="detail-header">
+              <div class="cover-frame">
+                <img id="coverImage" alt="Bìa truyện">
+              </div>
+
+              <div class="detail-main">
+                <div class="detail-top">
+                  <div>
+                    <p class="eyebrow">Truyện Được Chọn</p>
+                    <h2 id="novelTitle"></h2>
+                  </div>
+                  <a id="novelSource" class="source-link" target="_blank" rel="noreferrer"></a>
+                </div>
+
+                <p id="novelAuthor" class="detail-author"></p>
+                <div id="novelStats" class="stat-row"></div>
+                <p id="novelSummary" class="summary"></p>
+              </div>
+            </div>
+
+            <section class="toolbox">
+              <div class="toolbox-head">
+                <div>
+                  <h3>Tùy Chọn Tải</h3>
+                  <p id="selectionSummary" class="selection-text">Chưa chọn tập nào.</p>
+                </div>
+
+                <div class="actions">
+                  <button id="selectAllVolumesBtn" type="button" class="ghost-button">Chọn Tất Cả</button>
+                  <button id="clearVolumesBtn" type="button" class="ghost-button">Bỏ Chọn</button>
+                  <button id="downloadBtn" type="button">Bắt Đầu Tải</button>
+                </div>
+              </div>
+
+              <div class="mode-row">
+                <label for="epubModeSelect">Chế Độ EPUB</label>
+                <select id="epubModeSelect">
+                  <option value="0">Chỉ tải TXT</option>
+                  <option value="1">1 EPUB tổng</option>
+                  <option value="2">EPUB từng tập</option>
+                  <option value="3">Cả hai</option>
+                </select>
+              </div>
+            </section>
+
+            <section class="volume-section">
+              <div class="section-head">
+                <h3>Danh Sách Tập</h3>
+                <span id="volumeMeta" class="count-pill"></span>
+              </div>
+              <div id="volumeList" class="volume-list"></div>
+            </section>
+          </div>
+        </article>
+
+        <article class="task card">
+          <div class="task-head">
+            <div>
+              <h2>Tiến Độ Tải</h2>
+              <p class="task-copy">Tiến độ task và file đã tạo sẽ hiện tại đây.</p>
+            </div>
+            <span id="taskState" class="task-pill" data-state="idle">Chưa có task</span>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progress-bar">
+              <div id="progressFill" class="progress-fill"></div>
+            </div>
+            <span id="progressText">0%</span>
+          </div>
+
+          <div id="taskSummary" class="task-summary">Chưa có tác vụ nào đang chạy.</div>
+          <div id="taskDownloads" class="task-downloads hidden"></div>
+          <pre id="taskLogs" class="task-logs hidden"></pre>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
