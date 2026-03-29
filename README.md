@@ -15,10 +15,28 @@ Hako Downloader là công cụ local để tìm và tải Light Novel từ hệ 
 
 ## Yêu cầu
 
-- Node.js 20+
-- npm
+- Máy tính Windows, macOS hoặc Linux
+- Kết nối internet
+- Node.js 20+ và npm
 
 ## Cài đặt
+
+Nếu máy bạn chưa có Node.js, hãy làm theo các bước sau:
+
+1. Truy cập [https://nodejs.org](https://nodejs.org)
+2. Tải bản `LTS`
+3. Chạy file cài đặt và giữ cấu hình mặc định
+4. Đóng terminal cũ rồi mở lại
+5. Kiểm tra lại bằng lệnh:
+
+```bash
+node -v
+npm -v
+```
+
+Nếu terminal hiện ra số phiên bản, bạn có thể chuyển sang bước tiếp theo.
+
+Sau đó cài các thư viện của dự án:
 
 ```bash
 npm install
