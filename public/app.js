@@ -19,9 +19,11 @@ const COVER_PLACEHOLDER = 'data:image/svg+xml;charset=UTF-8,' + encodeURICompone
 const state = {
   currentNovel: null,
   currentResults: [],
+  currentCatalog: null,
   currentTaskId: null,
   taskPollTimer: null,
-  dnsProfiles: []
+  dnsProfiles: [],
+  currentSiteOrigin: ''
 };
 
 const elements = {
@@ -37,6 +39,9 @@ const elements = {
   applyDnsBtn: document.querySelector('#applyDnsBtn'),
   resultsTitle: document.querySelector('#resultsTitle'),
   resultsCount: document.querySelector('#resultsCount'),
+  downloadCatalogBtn: document.querySelector('#downloadCatalogBtn'),
+  batchEpubModeSelect: document.querySelector('#batchEpubModeSelect'),
+  batchConcurrencySelect: document.querySelector('#batchConcurrencySelect'),
   resultsList: document.querySelector('#resultsList'),
   detailEmpty: document.querySelector('#detailEmpty'),
   detailView: document.querySelector('#detailView'),
@@ -90,6 +95,34 @@ function getPathPreview(url) {
   }
 }
 
+function isValvrareDirectoryUrl(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.origin === 'https://valvrareteam.net'
+      && /^\/danh-sach-truyen(?:\/trang\/\d+)?\/?$/.test(parsedUrl.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isValvrareSite() {
+  return state.currentSiteOrigin === 'https://valvrareteam.net';
+}
+
+function updatePrimaryActionLabel() {
+  elements.loadRecommendationsBtn.textContent = isValvrareSite()
+    ? 'Crawl Danh Mục'
+    : 'Lam Moi Goi Y';
+}
+
+function updateCatalogDownloadButtonState() {
+  const totalItems = state.currentCatalog?.totalItems || 0;
+  elements.downloadCatalogBtn.disabled = !state.currentCatalog || totalItems === 0;
+  elements.downloadCatalogBtn.textContent = totalItems > 0
+    ? `Tải Toàn Bộ (${totalItems})`
+    : 'Tải Toàn Bộ';
+}
+
 function formatTaskStateLabel(status) {
   const labels = {
     queued: 'Đang xếp hàng',
@@ -103,6 +136,27 @@ function formatTaskStateLabel(status) {
 
 function renderStatPills(items) {
   return items.map(item => `<span class="stat-pill">${escapeHtml(item)}</span>`).join('');
+}
+
+function syncEpubModeSelects(source) {
+  const value = source?.value || '1';
+  if (elements.epubModeSelect && elements.epubModeSelect.value !== value) {
+    elements.epubModeSelect.value = value;
+  }
+  if (elements.batchEpubModeSelect && elements.batchEpubModeSelect.value !== value) {
+    elements.batchEpubModeSelect.value = value;
+  }
+}
+
+function getEpubModeLabel(value) {
+  const labels = {
+    '0': 'Chỉ tải TXT/HTML',
+    '1': '1 EPUB mỗi truyện',
+    '2': 'EPUB theo từng tập',
+    '3': 'Cả hai kiểu EPUB'
+  };
+
+  return labels[value] || value;
 }
 
 async function api(path, options = {}) {
@@ -123,13 +177,32 @@ async function api(path, options = {}) {
 
 function setStatus(status) {
   if (!status) return;
+  state.currentSiteOrigin = status.site || '';
   elements.siteStatus.textContent = `Trang: ${status.site || '...'}`;
   elements.dnsStatus.textContent = `DNS: ${status.dns || '...'}`;
+  updatePrimaryActionLabel();
+  updateCatalogDownloadButtonState();
 }
 
 function setResultsTitle(title, count) {
   elements.resultsTitle.textContent = title;
   elements.resultsCount.textContent = count ? `${count} truyện` : '';
+}
+
+function clearCatalogContext() {
+  state.currentCatalog = null;
+  updateCatalogDownloadButtonState();
+}
+
+function setCatalogContext(catalog, fallbackCount = 0) {
+  state.currentCatalog = catalog
+    ? {
+        ...catalog,
+        totalItems: catalog.totalItems || fallbackCount
+      }
+    : null;
+
+  updateCatalogDownloadButtonState();
 }
 
 function setTaskState(status) {
@@ -275,6 +348,116 @@ function renderTaskDownloads(task) {
   elements.taskDownloads.classList.remove('hidden');
 }
 
+function renderTaskDownloadItems(task) {
+  const downloadItems = (
+    task.result?.downloadItems
+    || task.result?.reportItems
+    || task.result?.epubItems
+    || []
+  ).filter(item => item.url);
+
+  if (!downloadItems.length) {
+    clearTaskDownloads();
+    return;
+  }
+
+  elements.taskDownloads.innerHTML = `
+    <p class="download-title">${task.result?.mode === 'batch' ? 'File báo cáo sẵn sàng:' : 'File EPUB sẵn sàng:'}</p>
+    <div class="download-links">
+      ${downloadItems.map(item => `
+        <a class="download-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">
+          ${escapeHtml(item.name)}
+        </a>
+      `).join('')}
+    </div>
+  `;
+  elements.taskDownloads.classList.remove('hidden');
+}
+
+function buildCompletedTaskSummary(task) {
+  if (task.result?.mode === 'batch') {
+    return `Hoàn tất batch: tải mới ${task.result?.downloadedCount || 0}, bỏ qua ${task.result?.skippedCount || 0}, lỗi ${task.result?.failureCount || 0}`;
+  }
+
+  return `HoÃ n táº¥t: ${task.result?.novelTitle || ''}`;
+}
+
+function buildCompletedTaskLogs(task) {
+  if (task.result?.mode === 'batch') {
+    return [
+      `Danh mục: ${task.result?.catalogUrl || ''}`,
+      `Thành công: ${task.result?.successCount || 0}/${task.result?.totalItems || 0}`,
+      `Tải mới: ${task.result?.downloadedCount || 0}`,
+      `Bỏ qua: ${task.result?.skippedCount || 0}`,
+      `Thất bại: ${task.result?.failureCount || 0}`,
+      ...(task.logs || []).map(log => `[${log.at}] ${log.message}`)
+    ].filter(Boolean).join('\n');
+  }
+
+  return [
+    `ThÆ° má»¥c TXT: ${task.result?.novelDir || ''}`,
+    ...(task.logs || []).map(log => `[${log.at}] ${log.message}`)
+  ].filter(Boolean).join('\n');
+}
+
+function buildRunningTaskSummary(task) {
+  if (task.payload?.mode === 'batch') {
+    const currentIndex = task.payload.currentNovelIndex || 0;
+    const totalNovels = task.payload.totalNovels || 0;
+    const currentTitle = task.payload.currentNovelTitle || '';
+    const activeNovelCount = task.payload.activeNovelCount || 0;
+    return currentTitle
+      ? `Đang tải batch ${currentIndex}/${totalNovels} | song song ${activeNovelCount}: ${currentTitle}`
+      : 'Đang chuẩn bị tải hàng loạt...';
+  }
+
+  return task.payload?.novelTitle
+    ? `Äang xá»­ lÃ½: ${task.payload.novelTitle}`
+    : 'Äang chuáº©n bá»‹ táº£i...';
+}
+
+function buildCompletedTaskSummary(task) {
+  if (task.result?.mode === 'batch') {
+    return `Hoàn tất batch: tải mới ${task.result?.downloadedCount || 0}, bỏ qua ${task.result?.skippedCount || 0}, lỗi ${task.result?.failureCount || 0}`;
+  }
+
+  return `Hoàn tất: ${task.result?.novelTitle || ''}`;
+}
+
+function buildCompletedTaskLogs(task) {
+  if (task.result?.mode === 'batch') {
+    return [
+      `Danh mục: ${task.result?.catalogUrl || ''}`,
+      `Thành công: ${task.result?.successCount || 0}/${task.result?.totalItems || 0}`,
+      `Tải mới: ${task.result?.downloadedCount || 0}`,
+      `Bỏ qua: ${task.result?.skippedCount || 0}`,
+      `Thất bại: ${task.result?.failureCount || 0}`,
+      ...(task.logs || []).map(log => `[${log.at}] ${log.message}`)
+    ].filter(Boolean).join('\n');
+  }
+
+  return [
+    `Thư mục TXT: ${task.result?.novelDir || ''}`,
+    ...(task.logs || []).map(log => `[${log.at}] ${log.message}`)
+  ].filter(Boolean).join('\n');
+}
+
+function buildRunningTaskSummary(task) {
+  if (task.payload?.mode === 'batch') {
+    const currentIndex = task.payload.currentNovelIndex || 0;
+    const totalNovels = task.payload.totalNovels || 0;
+    const currentTitle = task.payload.currentNovelTitle || '';
+    const activeNovelCount = task.payload.activeNovelCount || 0;
+    return currentTitle
+      ? `Đang tải batch ${currentIndex}/${totalNovels} | song song ${activeNovelCount}: ${currentTitle}`
+      : 'Đang chuẩn bị tải hàng loạt...';
+  }
+
+  return task.payload?.novelTitle
+    ? `Đang xử lý: ${task.payload.novelTitle}`
+    : 'Đang chuẩn bị tải...';
+}
+
 function renderTask(task) {
   if (!task) {
     setTaskState();
@@ -293,8 +476,16 @@ function renderTask(task) {
   elements.progressText.textContent = `${task.progress || 0}%`;
   elements.taskLogs.classList.remove('hidden');
 
+  if (task.status === 'completed' && task.result?.mode === 'batch') {
+    renderTaskDownloadItems(task);
+    elements.taskSummary.textContent = buildCompletedTaskSummary(task);
+    elements.taskLogs.textContent = buildCompletedTaskLogs(task);
+    stopTaskPolling();
+    return;
+  }
+
   if (task.status === 'completed') {
-    renderTaskDownloads(task);
+    renderTaskDownloadItems(task);
     elements.taskSummary.textContent = `Hoàn tất: ${task.result?.novelTitle || ''}`;
     elements.taskLogs.textContent = [
       `Thư mục TXT: ${task.result?.novelDir || ''}`,
@@ -311,6 +502,12 @@ function renderTask(task) {
     elements.taskSummary.classList.add('error-text');
     elements.taskLogs.textContent = (task.logs || []).map(log => `[${log.at}] ${log.message}`).join('\n');
     stopTaskPolling();
+    return;
+  }
+
+  if (task.payload?.mode === 'batch') {
+    elements.taskSummary.textContent = buildRunningTaskSummary(task);
+    elements.taskLogs.textContent = (task.logs || []).map(log => `[${log.at}] ${log.message}`).join('\n');
     return;
   }
 
@@ -367,12 +564,33 @@ async function loadDnsProfiles() {
 }
 
 async function loadRecommendations() {
+  clearCatalogContext();
   setResultsTitle('Gợi Ý Từ Trang Chủ', 0);
   elements.resultsList.innerHTML = '<p>Đang tải gợi ý...</p>';
   const data = await api('/api/recommendations');
   setStatus(data.status);
   setResultsTitle('Gợi Ý Từ Trang Chủ', data.items.length);
   renderResults(data.items);
+}
+
+async function loadCatalog(url) {
+  setResultsTitle('Danh Mục Valvrare', 0);
+  elements.resultsList.innerHTML = '<p>Đang crawl toàn bộ thư viện...</p>';
+
+  const data = await api(`/api/catalog?url=${encodeURIComponent(url)}`);
+  setStatus(data.status);
+  setCatalogContext(data.catalog, data.items.length);
+  setResultsTitle('Danh Mục Valvrare', data.catalog?.totalItems || data.items.length);
+  renderResults(data.items);
+}
+
+async function loadLibraryOverview() {
+  if (isValvrareSite()) {
+    await loadCatalog('https://valvrareteam.net/danh-sach-truyen/trang/1');
+    return;
+  }
+
+  await loadRecommendations();
 }
 
 async function loadNovel(url) {
@@ -396,6 +614,7 @@ async function loadNovel(url) {
 }
 
 async function runSearch(query) {
+  clearCatalogContext();
   setResultsTitle(`Kết quả: ${query}`, 0);
   elements.resultsList.innerHTML = '<p>Đang tìm kiếm...</p>';
   const data = await api(`/api/search?q=${encodeURIComponent(query)}`);
@@ -419,6 +638,36 @@ async function applyDns() {
   });
 
   elements.dnsStatus.textContent = `DNS: ${data.current.label}`;
+}
+
+async function startBatchDownload() {
+  if (!state.currentCatalog?.sourceUrl) {
+    elements.taskSummary.textContent = 'Hãy mở danh mục Valvrare trước khi tải hàng loạt.';
+    elements.taskSummary.classList.add('error-text');
+    return;
+  }
+
+  const totalItems = state.currentCatalog.totalItems || state.currentResults.length;
+  const epubMode = elements.batchEpubModeSelect?.value || elements.epubModeSelect?.value || '1';
+  const batchConcurrency = elements.batchConcurrencySelect?.value || '2';
+  const epubModeLabel = getEpubModeLabel(epubMode);
+  const confirmed = window.confirm(
+    `Sẽ tải hàng loạt toàn bộ ${totalItems} truyện trong danh mục này.\nChế độ EPUB: ${epubModeLabel}\nSong song: ${batchConcurrency} truyện\nTiếp tục?`
+  );
+
+  if (!confirmed) return;
+
+  const data = await api('/api/batch-download', {
+    method: 'POST',
+    body: JSON.stringify({
+      catalogUrl: state.currentCatalog.sourceUrl,
+      epubMode,
+      batchConcurrency
+    })
+  });
+
+  renderTask(data.task);
+  startTaskPolling(data.task.id);
 }
 
 async function startDownload() {
@@ -450,8 +699,24 @@ async function startDownload() {
 
 function bindEvents() {
   elements.loadRecommendationsBtn.addEventListener('click', () => {
-    loadRecommendations().catch(showInlineError);
+    loadLibraryOverview().catch(showInlineError);
   });
+
+  elements.downloadCatalogBtn.addEventListener('click', () => {
+    startBatchDownload().catch(showInlineError);
+  });
+
+  if (elements.batchEpubModeSelect) {
+    elements.batchEpubModeSelect.addEventListener('change', event => {
+      syncEpubModeSelects(event.target);
+    });
+  }
+
+  if (elements.epubModeSelect) {
+    elements.epubModeSelect.addEventListener('change', event => {
+      syncEpubModeSelects(event.target);
+    });
+  }
 
   elements.searchForm.addEventListener('submit', event => {
     event.preventDefault();
@@ -464,6 +729,12 @@ function bindEvents() {
     event.preventDefault();
     const url = elements.directUrlInput.value.trim();
     if (!url) return;
+
+    if (isValvrareDirectoryUrl(url)) {
+      loadCatalog(url).catch(showInlineError);
+      return;
+    }
+
     loadNovel(url).catch(showInlineError);
   });
 
@@ -517,6 +788,8 @@ async function bootstrap() {
   bindEvents();
   renderTask(null);
   updateDownloadButtonState();
+  updateCatalogDownloadButtonState();
+  syncEpubModeSelects(elements.batchEpubModeSelect || elements.epubModeSelect);
   await loadStatus();
   await loadDnsProfiles();
   await loadRecommendations();

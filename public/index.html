@@ -63,7 +63,26 @@
 
         <div class="results-head">
           <h3 id="resultsTitle">Gợi Ý Từ Trang Chủ</h3>
-          <span id="resultsCount" class="count-pill"></span>
+            <div class="results-meta">
+              <button id="downloadCatalogBtn" type="button" class="ghost-button" disabled>Tải Toàn Bộ</button>
+              <span id="resultsCount" class="count-pill"></span>
+            </div>
+        </div>
+
+        <div class="batch-controls">
+          <label for="batchEpubModeSelect">Chế độ EPUB khi tải toàn bộ</label>
+          <select id="batchEpubModeSelect">
+            <option value="0">Chỉ tải TXT/HTML</option>
+            <option value="1" selected>1 EPUB mỗi truyện</option>
+            <option value="2">EPUB theo từng tập</option>
+            <option value="3">Cả hai kiểu EPUB</option>
+          </select>
+          <label for="batchConcurrencySelect">Số truyện tải song song</label>
+          <select id="batchConcurrencySelect">
+            <option value="1">1 truyện</option>
+            <option value="2" selected>2 truyện</option>
+            <option value="3">3 truyện</option>
+          </select>
         </div>
 
         <div id="resultsList" class="results-list"></div>

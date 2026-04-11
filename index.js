@@ -8,6 +8,8 @@ const net = require('net');
 const path = require('path');
 const { terminal: term } = require('terminal-kit');
 const EpubGen = require('epub-gen-memory').default;
+const VALVRARE_ORIGIN = 'https://valvrareteam.net';
+const VALVRARE_DIRECTORY_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -19,7 +21,8 @@ const HEADERS = {
 const SITE_ORIGINS = [
   'https://docln.net',
   'https://docln.sbs',
-  'https://ln.hako.vn'
+  'https://ln.hako.vn',
+  VALVRARE_ORIGIN
 ];
 
 const DNS_PROFILES = {
@@ -58,6 +61,7 @@ let dnsProfile = createDnsProfile(DNS_PROFILES.system.label, DNS_PROFILES.system
 let httpClient;
 let terminalImageModulePromise;
 let terminalGraphicsSupportPromise;
+let valvrareDirectoryCache = null;
 
 applyDnsProfile(DNS_PROFILES.system);
 
@@ -74,7 +78,16 @@ function delay(ms) {
 }
 
 function sanitizeFileName(value) {
-  return value.replace(/[\/\\?%*:|"<>]/g, '-').trim();
+  const normalized = String(value || '').normalize('NFC');
+  const sanitized = normalized
+    .replace(/[\/\\?%*:|"<>]/g, '-')
+    .replace(/[. ]+$/g, '')
+    .trim();
+
+  const safeValue = sanitized || 'untitled';
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(safeValue)
+    ? `_${safeValue}`
+    : safeValue;
 }
 
 function normalizeWhitespace(value) {
@@ -95,7 +108,27 @@ function truncate(value, width) {
 }
 
 function isNovelPath(pathname) {
-  return /^\/truyen\/\d+(?:-[^/?#]+)?\/?$/.test(pathname);
+  return /^\/truyen\/\d+(?:-[^/?#]+)?\/?$/.test(pathname)
+    || /^\/truyen\/[^/?#]+\/?$/.test(pathname);
+}
+
+function isValvrareOrigin(origin) {
+  return origin === VALVRARE_ORIGIN;
+}
+
+function isValvrareDirectoryPath(pathname) {
+  return /^\/danh-sach-truyen(?:\/trang\/\d+)?\/?$/.test(pathname);
+}
+
+function isValvrareDirectoryUrl(href) {
+  if (!href) return false;
+
+  try {
+    const url = new URL(href, VALVRARE_ORIGIN);
+    return isValvrareOrigin(url.origin) && isValvrareDirectoryPath(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function isNovelHref(href) {
@@ -145,6 +178,16 @@ function getOrigin(url) {
   } catch {
     return activeOrigin;
   }
+}
+
+function buildRequestHeaders(targetUrl) {
+  const targetOrigin = getOrigin(targetUrl);
+  const refererOrigin = isSiteOrigin(targetOrigin) ? targetOrigin : activeOrigin;
+
+  return {
+    ...HEADERS,
+    Referer: `${refererOrigin}/`
+  };
 }
 
 function isSiteOrigin(origin) {
@@ -346,6 +389,8 @@ function aggregateNovelItems(items) {
     existing.count += 1;
     if (!existing.title && item.title) existing.title = item.title;
     if (!existing.imageUrl && item.imageUrl) existing.imageUrl = item.imageUrl;
+    if (!existing.summary && item.summary) existing.summary = item.summary;
+    if (!existing.badge && item.badge) existing.badge = item.badge;
   });
 
   return [...map.values()].filter(item => item.title && !NAV_TEXT_BLACKLIST.has(normalizeSearchText(item.title)));
@@ -373,6 +418,141 @@ function extractNovelCandidatesFromHtml(html, pageUrl) {
   });
 
   return aggregateNovelItems(items);
+}
+
+function extractValvrareDirectoryItems(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const items = [];
+
+  $('.nd-novel-card').each((_, card) => {
+    const cardNode = $(card);
+    const titleAnchor = cardNode.find('.nd-novel-title-link[href]').first();
+    const imageAnchor = cardNode.find('.nd-novel-image-link[href]').first();
+    const href = titleAnchor.attr('href') || imageAnchor.attr('href');
+    const url = normalizeNovelUrl(href, pageUrl);
+    const title = normalizeWhitespace(
+      cardNode.find('.nd-novel-title').first().text()
+      || titleAnchor.attr('title')
+      || titleAnchor.text()
+      || imageAnchor.find('img').first().attr('alt')
+    );
+
+    if (!url || !title) return;
+
+    const imageNode = cardNode.find('.nd-novel-image img').first();
+    const imageUrl = normalizeUrl(
+      imageNode.attr('src')
+      || imageNode.attr('data-src')
+      || '',
+      pageUrl
+    );
+    const summary = normalizeWhitespace(cardNode.find('.nd-novel-description').first().text());
+
+    items.push({
+      title,
+      imageUrl,
+      summary,
+      badge: 'Danh mục',
+      url
+    });
+  });
+
+  return items;
+}
+
+function extractValvrareDirectoryMeta(html) {
+  const $ = cheerio.load(html);
+  let totalPages = 0;
+  let totalItems = 0;
+
+  $('.nd-pagination a[href*="/danh-sach-truyen/trang/"]').each((_, anchor) => {
+    const href = $(anchor).attr('href') || '';
+    const hrefMatch = href.match(/\/trang\/(\d+)/);
+    const hrefPage = Number.parseInt(hrefMatch?.[1] || '', 10);
+    const textPage = Number.parseInt(normalizeWhitespace($(anchor).text()), 10);
+
+    if (Number.isInteger(hrefPage)) {
+      totalPages = Math.max(totalPages, hrefPage);
+    }
+
+    if (Number.isInteger(textPage)) {
+      totalPages = Math.max(totalPages, textPage);
+    }
+  });
+
+  const totalPagesMatch = html.match(/"totalPages":(\d+)/);
+  const totalItemsMatch = html.match(/"totalItems":(\d+)/);
+  const headingMatch = normalizeWhitespace($('.nd-section-headers h2').first().text()).match(/\((\d+)\)/);
+
+  if (totalPagesMatch) {
+    totalPages = Math.max(totalPages, Number.parseInt(totalPagesMatch[1], 10) || 0);
+  }
+
+  if (totalItemsMatch) {
+    totalItems = Number.parseInt(totalItemsMatch[1], 10) || 0;
+  }
+
+  if (!totalItems && headingMatch) {
+    totalItems = Number.parseInt(headingMatch[1], 10) || 0;
+  }
+
+  return {
+    totalPages: Math.max(totalPages, 1),
+    totalItems
+  };
+}
+
+function getCachedValvrareDirectory() {
+  if (!valvrareDirectoryCache) return null;
+
+  if (Date.now() - valvrareDirectoryCache.timestamp > VALVRARE_DIRECTORY_CACHE_TTL_MS) {
+    valvrareDirectoryCache = null;
+    return null;
+  }
+
+  return valvrareDirectoryCache;
+}
+
+function buildValvrareDirectoryPageUrl(pageNumber = 1) {
+  return normalizeUrl(`/danh-sach-truyen/trang/${pageNumber}`, VALVRARE_ORIGIN);
+}
+
+async function crawlValvrareDirectory() {
+  const cached = getCachedValvrareDirectory();
+  if (cached) return cached;
+
+  const firstPageUrl = buildValvrareDirectoryPageUrl(1);
+  const firstPage = await fetchHtmlPage(firstPageUrl);
+  const firstPagePath = new URL(firstPage.url).pathname;
+
+  if (!isValvrareOrigin(getOrigin(firstPage.url)) || !isValvrareDirectoryPath(firstPagePath)) {
+    throw new Error('Không thể mở danh mục truyện Valvrare.');
+  }
+
+  const directoryItems = [...extractValvrareDirectoryItems(firstPage.html, firstPage.url)];
+  const directoryMeta = extractValvrareDirectoryMeta(firstPage.html);
+
+  for (let pageNumber = 2; pageNumber <= directoryMeta.totalPages; pageNumber += 1) {
+    const page = await fetchHtmlPage(buildValvrareDirectoryPageUrl(pageNumber));
+    directoryItems.push(...extractValvrareDirectoryItems(page.html, page.url));
+  }
+
+  const items = aggregateNovelItems(directoryItems)
+    .sort((left, right) => left.firstIndex - right.firstIndex);
+
+  if (items.length === 0) {
+    throw new Error('Không tìm thấy truyện nào trong danh mục Valvrare.');
+  }
+
+  valvrareDirectoryCache = {
+    items,
+    sourceUrl: firstPageUrl,
+    totalPages: directoryMeta.totalPages,
+    totalItems: directoryMeta.totalItems || items.length,
+    timestamp: Date.now()
+  };
+
+  return valvrareDirectoryCache;
 }
 
 function scoreNovelMatch(title, query) {
@@ -416,7 +596,10 @@ async function fetchHtmlPage(pathOrUrl) {
 
   for (const candidateUrl of candidates) {
     try {
-      const response = await httpClient.get(candidateUrl, { responseType: 'text' });
+      const response = await httpClient.get(candidateUrl, {
+        responseType: 'text',
+        headers: buildRequestHeaders(candidateUrl)
+      });
       const html = typeof response.data === 'string' ? response.data : String(response.data);
       const finalUrl = getFinalResponseUrl(response, candidateUrl);
       const finalOrigin = getOrigin(finalUrl);
@@ -441,7 +624,10 @@ async function fetchBinary(pathOrUrl) {
 
   for (const candidateUrl of candidates) {
     try {
-      const response = await httpClient.get(candidateUrl, { responseType: 'arraybuffer' });
+      const response = await httpClient.get(candidateUrl, {
+        responseType: 'arraybuffer',
+        headers: buildRequestHeaders(candidateUrl)
+      });
       return Buffer.from(response.data);
     } catch (error) {
       lastError = error;
@@ -452,6 +638,11 @@ async function fetchBinary(pathOrUrl) {
 }
 
 async function fetchHomepageRecommendations() {
+  if (isValvrareOrigin(activeOrigin)) {
+    const directory = await crawlValvrareDirectory();
+    return directory.items;
+  }
+
   const page = await fetchHtmlPage('/');
   const novels = extractNovelCandidatesFromHtml(page.html, page.url)
     .sort((left, right) => right.count - left.count || left.firstIndex - right.firstIndex)
@@ -465,6 +656,16 @@ async function fetchHomepageRecommendations() {
 }
 
 async function searchNovels(keyword) {
+  if (isValvrareOrigin(activeOrigin)) {
+    const directory = await crawlValvrareDirectory();
+
+    return directory.items
+      .map(item => ({ ...item, score: scoreNovelMatch(item.title, keyword) }))
+      .filter(item => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.firstIndex - right.firstIndex)
+      .slice(0, 30);
+  }
+
   const encodedKeyword = encodeURIComponent(keyword);
   const searchPaths = [
     `/tim-kiem-nang-cao?author=&illustrator=&page=1&rejectgenres=&selectgenres=&status=0&title=${encodedKeyword}`,
@@ -492,6 +693,7 @@ async function searchNovels(keyword) {
 
 function extractSummary($) {
   const selectors = [
+    '.rd-description-content',
     '.summary-content',
     '.series-summary',
     '.summary',
@@ -535,6 +737,14 @@ function extractAuthor($) {
     author = normalizeWhitespace($('a[href*="/tac-gia/"]').first().text());
   }
 
+  if (!author) {
+    author = normalizeWhitespace($('.rd-author-name').first().text());
+  }
+
+  if (!author) {
+    author = normalizeWhitespace($('meta[name="author"]').attr('content'));
+  }
+
   return author || 'Khuyet danh';
 }
 
@@ -542,10 +752,49 @@ function extractCoverUrl($, pageUrl) {
   const rawCoverStyle = $('.series-cover .img-in-ratio').first().attr('style') || '';
   const coverFromStyle = rawCoverStyle.match(/url\(['"]?(.*?)['"]?\)/)?.[1] || '';
   const coverFromImage = $('.series-cover img').first().attr('src')
+    || $('.rd-cover-image').first().attr('src')
     || $('meta[property="og:image"]').attr('content')
     || '';
 
   return normalizeUrl(coverFromStyle || coverFromImage, pageUrl);
+}
+
+function extractValvrareVolumes($, pageUrl) {
+  const moduleTitles = $('.modules-list .module-container .module-title')
+    .map((_, element) => normalizeWhitespace($(element).text()))
+    .get()
+    .filter(Boolean);
+  const moduleSections = $('.module-chapters').toArray();
+
+  if (moduleTitles.length === 0 || moduleSections.length === 0) return [];
+
+  const volumes = [];
+  const totalSections = Math.min(moduleTitles.length, moduleSections.length);
+
+  for (let index = 0; index < totalSections; index += 1) {
+    const title = moduleTitles[index] || `Tap ${index + 1}`;
+    const section = moduleSections[index];
+    const chapters = [];
+
+    $(section).find('.module-chapter-item').each((__, chapterItem) => {
+      const anchor = $(chapterItem).find('a.chapter-title-link[href]').first();
+      const href = anchor.attr('href');
+      const chapterUrl = normalizeUrl(href, pageUrl);
+      const chapterTitle = normalizeWhitespace(anchor.text());
+
+      if (!chapterUrl || !chapterTitle) return;
+      chapters.push({
+        title: chapterTitle,
+        url: chapterUrl
+      });
+    });
+
+    if (chapters.length > 0) {
+      volumes.push({ title, chapters });
+    }
+  }
+
+  return volumes;
 }
 
 function extractVolumes($, pageUrl) {
@@ -575,6 +824,9 @@ function extractVolumes($, pageUrl) {
 
   if (volumes.length > 0) return volumes;
 
+  const valvrareVolumes = extractValvrareVolumes($, pageUrl);
+  if (valvrareVolumes.length > 0) return valvrareVolumes;
+
   const fallbackChapters = [];
   $('.list-chapters li').each((_, listItem) => {
     const anchor = $(listItem).find('.chapter-name a').first();
@@ -599,15 +851,30 @@ function extractVolumes($, pageUrl) {
   return volumes;
 }
 
+function extractNovelTitle($) {
+  const valvrareTitleNode = $('.rd-novel-title').first().clone();
+  if (valvrareTitleNode.length > 0) {
+    valvrareTitleNode.find('button, span').remove();
+  }
+
+  return normalizeWhitespace($('.series-name a').first().text())
+    || normalizeWhitespace(valvrareTitleNode.text())
+    || normalizeWhitespace($('h1').first().text())
+    || normalizeWhitespace($('meta[property="og:title"]').attr('content') || '')
+    || normalizeWhitespace($('title').text())
+    || 'Chua ro tieu de';
+}
+
 async function fetchNovelInfo(url) {
   const page = await fetchHtmlPage(url);
   const $ = cheerio.load(page.html);
 
-  const title = normalizeWhitespace($('.series-name a').first().text())
+  let title = normalizeWhitespace($('.series-name a').first().text())
     || normalizeWhitespace($('h1').first().text())
     || normalizeWhitespace($('title').text().replace(/\s*-\s*Cổng Light Novel.*$/i, ''))
     || 'Chua ro tieu de';
 
+  title = extractNovelTitle($);
   const volumes = extractVolumes($, page.url);
   if (volumes.length === 0) {
     throw new Error('Khong doc duoc danh sach tap/chuong cua truyen nay.');
@@ -662,6 +929,125 @@ function decodeProtected(dataC, dataK, dataS) {
   return result;
 }
 
+function getChapterContentRoot($) {
+  const selectors = [
+    '#chapter-content',
+    '.chapter-content'
+  ];
+
+  for (const selector of selectors) {
+    const root = $(selector).first();
+    if (root.length > 0) return root;
+  }
+
+  return null;
+}
+
+function guessImageExtension(buffer) {
+  if (!buffer || buffer.length < 4) return '.jpg';
+  const hex = buffer.slice(0, 4).toString('hex');
+  if (hex.startsWith('89504e47')) return '.png';
+  if (hex.startsWith('ffd8ff')) return '.jpg';
+  if (hex.startsWith('47494638')) return '.gif';
+  if (hex.startsWith('52494646')) return '.webp';
+  return '.jpg';
+}
+
+const BANNER_IMAGE_CLASS_TOKENS = new Set(['d-none', 'd-md-none', 'd-md-block']);
+
+function isBannerImage(classAttr) {
+  if (!classAttr) return false;
+  return classAttr.split(/\s+/).some(function (token) { return BANNER_IMAGE_CLASS_TOKENS.has(token); });
+}
+
+async function downloadImageToFile(imageUrl, destPath) {
+  try {
+    const response = await httpClient.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 15000,
+      headers: buildRequestHeaders(imageUrl)
+    });
+    const buffer = Buffer.from(response.data);
+    if (buffer.length < 100) return null;
+    const ext = guessImageExtension(buffer);
+    const finalPath = destPath + ext;
+    await fs.writeFile(finalPath, buffer);
+    return finalPath;
+  } catch {
+    return null;
+  }
+}
+
+async function embedImagesInHtml(contentHtml, pageUrl, tempDir) {
+  const $doc = cheerio.load(contentHtml, null, false);
+
+  $doc('img').each(function (_, img) {
+    if (isBannerImage($doc(img).attr('class'))) {
+      $doc(img).remove();
+    }
+  });
+
+  const images = $doc('img').toArray();
+  let embedded = 0;
+  let failed = 0;
+
+  await fs.ensureDir(tempDir);
+
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    const src = $doc(img).attr('src') || $doc(img).attr('data-src') || '';
+    const imageUrl = normalizeUrl(src, pageUrl);
+    if (!imageUrl || imageUrl.startsWith('data:') || imageUrl.startsWith('file:')) continue;
+
+    const baseName = 'img_' + Date.now() + '_' + i;
+    const savedPath = await downloadImageToFile(imageUrl, path.join(tempDir, baseName));
+    if (savedPath) {
+      const fileUrl = 'file:///' + savedPath.replace(/\\/g, '/');
+      $doc(img).attr('src', fileUrl);
+      $doc(img).removeAttr('data-src');
+      embedded += 1;
+    } else {
+      failed += 1;
+    }
+  }
+
+  if (embedded > 0 || failed > 0) {
+    process.stdout.write(' [' + embedded + ' ảnh');
+    if (failed > 0) process.stdout.write(', lỗi ' + failed);
+    process.stdout.write(']');
+  }
+
+  return $doc.html();
+}
+
+async function cleanupTempImages(tempDir) {
+  try { await fs.remove(tempDir); } catch { /* ignore */ }
+}
+
+function buildChapterTextContent($, contentRoot, volumeTitle, chapterTitle, pageUrl) {
+  let textContent = `${volumeTitle}\n\n${chapterTitle}\n\n`;
+  const blocks = contentRoot.children().length > 0 ? contentRoot.children() : contentRoot.contents();
+
+  blocks.each((_, element) => {
+    const node = $(element);
+    const images = node.is('img') ? node : node.find('img');
+
+    images.each((__, image) => {
+      const imageUrl = normalizeUrl($(image).attr('src') || $(image).attr('data-src'), pageUrl);
+      if (imageUrl) {
+        textContent += `[Anh: ${imageUrl}]\n\n`;
+      }
+    });
+
+    const line = normalizeWhitespace(node.text());
+    if (line) {
+      textContent += `${line}\n\n`;
+    }
+  });
+
+  return textContent;
+}
+
 async function generateEpub(epubPath, title, author, coverUrl, chapters) {
   const options = {
     title,
@@ -695,6 +1081,7 @@ async function generateEpub(epubPath, title, author, coverUrl, chapters) {
 
 async function downloadChapters(volume, volumeDir, author) {
   const epubChapters = [];
+  const tempDir = path.join(volumeDir, '_temp_epub_images');
 
   for (const [index, chapter] of volume.chapters.entries()) {
     const prefix = `[${index + 1}/${volume.chapters.length}]`;
@@ -711,7 +1098,9 @@ async function downloadChapters(volume, volumeDir, author) {
       contentHtml = await fs.readFile(htmlPath, 'utf-8');
     } else {
       try {
-        const chapterResponse = await httpClient.get(chapter.url);
+        const chapterResponse = await httpClient.get(chapter.url, {
+          headers: buildRequestHeaders(chapter.url)
+        });
         let $chapter = cheerio.load(chapterResponse.data);
         const protectedDiv = $chapter('#chapter-c-protected');
 
@@ -729,23 +1118,14 @@ async function downloadChapters(volume, volumeDir, author) {
           }
         }
 
-        contentHtml = $chapter('#chapter-content').html();
+        const contentRoot = getChapterContentRoot($chapter);
+        contentHtml = contentRoot?.html() || '';
         if (!contentHtml) {
           console.log('(trong)');
           continue;
         }
 
-        let textContent = `${volume.title}\n\n${chapter.title}\n\n`;
-        $chapter('#chapter-content > p').each((_, paragraph) => {
-          const imageUrl = $chapter(paragraph).find('img').attr('src');
-          if (imageUrl) {
-            textContent += `[Anh: ${imageUrl}]\n\n`;
-            return;
-          }
-
-          const line = $chapter(paragraph).text().trim();
-          if (line) textContent += `${line}\n\n`;
-        });
+        const textContent = buildChapterTextContent($chapter, contentRoot, volume.title, chapter.title, chapter.url);
 
         await fs.writeFile(txtPath, textContent, 'utf-8');
         await fs.writeFile(htmlPath, contentHtml, 'utf-8');
@@ -761,14 +1141,84 @@ async function downloadChapters(volume, volumeDir, author) {
       await delay(2000);
     }
 
+    const epubContent = contentHtml
+      ? await embedImagesInHtml(contentHtml, chapter.url, tempDir)
+      : '';
+
     epubChapters.push({
       title: `${volume.title} - ${chapter.title}`,
       author,
-      content: contentHtml
+      content: epubContent
     });
   }
 
-  return epubChapters;
+  return { epubChapters, tempDir };
+}
+
+async function removeIfExists(targetPath) {
+  if (await fs.pathExists(targetPath)) {
+    await fs.remove(targetPath);
+    return true;
+  }
+
+  return false;
+}
+
+async function cleanupLegacyEpubOutputs(novel, selectedVolumeIndexes, novelDir) {
+  const safeTitle = sanitizeFileName(novel.title);
+  const downloadsDir = path.join(__dirname, 'downloads');
+  const legacyPaths = [
+    path.join(downloadsDir, `${safeTitle}.epub`),
+    ...selectedVolumeIndexes.map(volumeIndex => {
+      const safeVolumeTitle = sanitizeFileName(novel.volumes[volumeIndex].title);
+      return path.join(downloadsDir, `${safeTitle} - ${safeVolumeTitle}.epub`);
+    })
+  ].filter(filePath => path.dirname(filePath) !== novelDir);
+
+  let removedCount = 0;
+
+  for (const legacyPath of legacyPaths) {
+    if (await removeIfExists(legacyPath)) {
+      removedCount += 1;
+    }
+  }
+
+  if (removedCount > 0) {
+    console.log(`[Dọn dẹp] Đã xóa ${removedCount} file EPUB cũ ở thư mục gốc.`);
+  }
+}
+
+async function cleanupIntermediateChapterFiles(volumeDirs) {
+  let removedCount = 0;
+  let removedVolumeDirs = 0;
+
+  for (const volumeDir of volumeDirs) {
+    if (!await fs.pathExists(volumeDir)) continue;
+
+    const entries = await fs.readdir(volumeDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.txt') && !entry.name.endsWith('.html')) continue;
+
+      await fs.remove(path.join(volumeDir, entry.name));
+      removedCount += 1;
+    }
+
+    const remainingEntries = await fs.readdir(volumeDir);
+    if (remainingEntries.length === 0) {
+      await fs.remove(volumeDir);
+      removedVolumeDirs += 1;
+    }
+  }
+
+  if (removedCount > 0) {
+    console.log(`[Dọn dẹp] Đã xóa ${removedCount} file TXT/HTML trung gian.`);
+  }
+
+  if (removedVolumeDirs > 0) {
+    console.log(`[Dọn dẹp] Đã xóa ${removedVolumeDirs} thư mục tập trống.`);
+  }
 }
 
 function enableInteractiveMode() {
@@ -976,24 +1426,32 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
 
   const allEpubChapters = [];
   const perVolumeChapters = {};
+  const volumeDirs = [];
+  const tempImageDirs = [];
 
   for (const volumeIndex of selectedVolumeIndexes) {
     const volume = novel.volumes[volumeIndex];
     const safeVolumeTitle = sanitizeFileName(volume.title);
     const volumeDir = path.join(novelDir, safeVolumeTitle);
     await fs.ensureDir(volumeDir);
+    volumeDirs.push(volumeDir);
 
     console.log(`\n--- ${volume.title} ---`);
-    const chapters = await downloadChapters(volume, volumeDir, novel.author);
+    const { epubChapters: chapters, tempDir } = await downloadChapters(volume, volumeDir, novel.author);
     allEpubChapters.push(...chapters);
     perVolumeChapters[volumeIndex] = {
       safeVolumeTitle,
       chapters
     };
+    tempImageDirs.push(tempDir);
+  }
+
+  if (epubMode !== '0') {
+    await cleanupLegacyEpubOutputs(novel, selectedVolumeIndexes, novelDir);
   }
 
   if (epubMode === '1' || epubMode === '3') {
-    const epubPath = path.join(__dirname, 'downloads', `${safeTitle}.epub`);
+    const epubPath = path.join(novelDir, `${safeTitle}.epub`);
     await generateEpub(epubPath, novel.title, novel.author, novel.coverUrl, [...allEpubChapters]);
   }
 
@@ -1002,7 +1460,7 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
       const record = perVolumeChapters[volumeIndex];
       if (!record || record.chapters.length === 0) continue;
 
-      const epubPath = path.join(__dirname, 'downloads', `${safeTitle} - ${record.safeVolumeTitle}.epub`);
+      const epubPath = path.join(novelDir, `${record.safeVolumeTitle}.epub`);
       await generateEpub(
         epubPath,
         `${novel.title} - ${novel.volumes[volumeIndex].title}`,
@@ -1013,10 +1471,19 @@ async function runDownloadFlow(novel, selectedVolumeIndexes, epubMode) {
     }
   }
 
+  // Clean up temp image files after EPUB generation
+  for (const dir of tempImageDirs) {
+    await cleanupTempImages(dir);
+  }
+
+  if (epubMode === '3') {
+    await cleanupIntermediateChapterFiles(volumeDirs);
+  }
+
   console.log('\n=== HOAN TAT ===');
   console.log(`TXT: ${novelDir}`);
   if (epubMode !== '0') {
-    console.log(`EPUB: ${path.join(__dirname, 'downloads')}`);
+    console.log(`EPUB: ${novelDir}`);
   }
 
   console.log('');
@@ -1127,12 +1594,21 @@ async function searchFlow() {
 }
 
 async function homepageFlow() {
-  await showLoadingScreen('Goi y tu trang chu', 'Dang crawl danh sach de ban chon...');
+  const isValvrareMode = isValvrareOrigin(activeOrigin);
+  const loadingTitle = isValvrareMode ? 'Danh mục Valvrare' : 'Gợi ý từ trang chủ';
+  const loadingSubtitle = isValvrareMode
+    ? 'Đang crawl toàn bộ thư viện Valvrare...'
+    : 'Đang crawl danh sách để bạn chọn...';
+
+  await showLoadingScreen(loadingTitle, loadingSubtitle);
   const novels = await fetchHomepageRecommendations();
+  const directory = isValvrareMode ? getCachedValvrareDirectory() : null;
 
   const selectedNovel = await selectNovelFromList(
-    'Goi y tu trang chu',
-    'Danh sach nay duoc gom tu nhung truyen dang xuat hien tren trang chu',
+    loadingTitle,
+    isValvrareMode
+      ? `Đã gom ${directory?.totalItems || novels.length} truyện từ ${directory?.totalPages || 1} trang danh mục`
+      : 'Danh sach nay duoc gom tu nhung truyen dang xuat hien tren trang chu',
     novels
   );
 
@@ -1144,8 +1620,26 @@ async function homepageFlow() {
 }
 
 async function directUrlFlow() {
-  const url = await promptText('Nhap URL truyen', 'Link truyen:');
+  const url = await promptText('Nhap URL', 'Link truyện hoặc danh mục:');
   if (!url) return;
+
+  if (isValvrareDirectoryUrl(url)) {
+    await showLoadingScreen('Danh mục Valvrare', url);
+    const directory = await crawlValvrareDirectory();
+
+    const selectedNovel = await selectNovelFromList(
+      'Danh mục Valvrare',
+      `Đã gom ${directory.totalItems} truyện từ ${directory.totalPages} trang danh mục`,
+      directory.items
+    );
+
+    if (!selectedNovel) return;
+
+    await showLoadingScreen('Dang lay thong tin truyen', selectedNovel.title);
+    const novel = await fetchNovelInfo(selectedNovel.url);
+    await showNovelDetailScreen(novel);
+    return;
+  }
 
   await showLoadingScreen('Dang lay thong tin truyen', url);
   const novel = await fetchNovelInfo(url);

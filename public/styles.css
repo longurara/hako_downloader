@@ -253,6 +253,27 @@ button:disabled {
   margin-top: 18px;
 }
 
+.results-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.batch-controls {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.batch-controls label {
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
 .results-list,
 .volume-list,
 .task-logs {
