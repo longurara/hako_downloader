@@ -531,8 +531,49 @@ button:disabled {
   align-items: start;
 }
 
+.volume-cover-thumb {
+  flex-shrink: 0;
+  width: 64px;
+  height: 92px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--line);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.volume-cover-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .volume-copy {
+  flex: 1;
   min-width: 0;
+}
+
+.volume-cover-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 4px 0;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+  user-select: none;
+}
+
+.volume-cover-option:hover {
+  color: var(--ink);
+}
+
+.volume-cover-option input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 .volume-index {

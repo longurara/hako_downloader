@@ -775,7 +775,7 @@ function extractValvrareVolumes($, pageUrl) {
     });
 
     if (chapters.length > 0) {
-      volumes.push({ title, chapters });
+      volumes.push({ title, chapters, coverUrl: '' });
     }
   }
 
@@ -788,6 +788,17 @@ function extractVolumes($, pageUrl) {
   $('.volume-list').each((_, element) => {
     const title = normalizeWhitespace($(element).find('.sect-title').first().text()) || `Tap ${volumes.length + 1}`;
     const chapters = [];
+
+    // Extract volume cover from volume-cover
+    let coverUrl = '';
+    const volumeCoverDiv = $(element).find('.volume-cover .content.img-in-ratio').first();
+    if (volumeCoverDiv.length > 0) {
+      const styleAttr = volumeCoverDiv.attr('style') || '';
+      const urlMatch = styleAttr.match(/url\(['"]?(.*?)['"]?\)/);
+      if (urlMatch && urlMatch[1]) {
+        coverUrl = normalizeUrl(urlMatch[1], pageUrl);
+      }
+    }
 
     $(element).find('.list-chapters li').each((__, listItem) => {
       const anchor = $(listItem).find('.chapter-name a').first();
@@ -803,7 +814,7 @@ function extractVolumes($, pageUrl) {
     });
 
     if (chapters.length > 0) {
-      volumes.push({ title, chapters });
+      volumes.push({ title, chapters, coverUrl });
     }
   });
 
@@ -829,7 +840,8 @@ function extractVolumes($, pageUrl) {
   if (fallbackChapters.length > 0) {
     volumes.push({
       title: 'Toan bo',
-      chapters: fallbackChapters
+      chapters: fallbackChapters,
+      coverUrl: ''
     });
   }
 
@@ -945,23 +957,6 @@ function isBannerImage(classAttr) {
   return classAttr.split(/\s+/).some(function (token) { return BANNER_IMAGE_CLASS_TOKENS.has(token); });
 }
 
-async function downloadImageToFile(imageUrl, destPath) {
-  try {
-    const response = await httpClient.get(imageUrl, {
-      responseType: 'arraybuffer',
-      timeout: 15000,
-      headers: buildRequestHeaders(imageUrl)
-    });
-    const buffer = Buffer.from(response.data);
-    if (buffer.length < 100) return null;
-    const ext = guessImageExtension(buffer);
-    const finalPath = destPath + ext;
-    await fs.writeFile(finalPath, buffer);
-    return finalPath;
-  } catch {
-    return null;
-  }
-}
 
 async function embedImagesInHtml(contentHtml, pageUrl, tempDir, handlers) {
   const $doc = cheerio.load(contentHtml, null, false);
@@ -976,6 +971,7 @@ async function embedImagesInHtml(contentHtml, pageUrl, tempDir, handlers) {
   const images = $doc('img').toArray();
   let embedded = 0;
   let failed = 0;
+  const errors = [];
 
   await fs.ensureDir(tempDir);
 
@@ -985,27 +981,79 @@ async function embedImagesInHtml(contentHtml, pageUrl, tempDir, handlers) {
     const imageUrl = normalizeUrl(src, pageUrl);
     if (!imageUrl || imageUrl.startsWith('data:') || imageUrl.startsWith('file:')) continue;
 
-    const baseName = 'img_' + Date.now() + '_' + i;
-    const savedPath = await downloadImageToFile(imageUrl, path.join(tempDir, baseName));
-    if (savedPath) {
-      // epub-gen-memory supports file:// URLs via fs.readFile
-      const fileUrl = 'file:///' + savedPath.replace(/\\/g, '/');
+    try {
+      // Build headers for image request
+      const imageHeaders = {
+        ...buildRequestHeaders(imageUrl),
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Sec-Fetch-Dest': 'image',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site'
+      };
+
+      const response = await httpClient.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 20000,
+        headers: imageHeaders,
+        maxRedirects: 10
+      });
+
+      const buffer = Buffer.from(response.data);
+
+      if (buffer.length < 100) {
+        failed += 1;
+        errors.push(`Ảnh ${i}: quá nhỏ (${buffer.length} bytes) - URL: ${imageUrl}`);
+        continue;
+      }
+
+      // Detect image extension from buffer
+      const ext = guessImageExtension(buffer);
+      const fileName = `img_${Date.now()}_${i}${ext}`;
+      const filePath = path.join(tempDir, fileName);
+
+      // Save original image without any processing
+      await fs.writeFile(filePath, buffer);
+
+      // Verify file was written correctly
+      const fileStats = await fs.stat(filePath);
+      if (fileStats.size < 100) {
+        failed += 1;
+        errors.push(`Ảnh ${i}: file lưu bị lỗi (${fileStats.size} bytes)`);
+        continue;
+      }
+
+      // Use file:// URL for epub-gen-memory to process
+      const fileUrl = 'file://' + filePath.replace(/\\/g, '/');
       $doc(img).attr('src', fileUrl);
       $doc(img).removeAttr('data-src');
+      // Add width constraint for better display on e-readers
+      $doc(img).attr('style', 'max-width: 100%; height: auto;');
       embedded += 1;
-    } else {
+    } catch (error) {
       failed += 1;
+      const statusCode = error.response?.status || 'N/A';
+      errors.push(`Ảnh ${i}: [${statusCode}] ${error.message} - URL: ${imageUrl}`);
     }
   }
 
   if (embedded > 0 || failed > 0) {
     if (handlers && handlers.onLog) {
-      handlers.onLog('[ảnh] Nhúng ' + embedded + ' ảnh' + (failed > 0 ? ', lỗi ' + failed : ''));
+      const msg = `[ảnh] Nhúng ${embedded} ảnh` + (failed > 0 ? `, lỗi ${failed}` : '');
+      handlers.onLog(msg);
+
+      // Log errors if any
+      if (errors.length > 0 && errors.length <= 5) {
+        errors.forEach(err => handlers.onLog(`  ${err}`));
+      } else if (errors.length > 5) {
+        errors.slice(0, 3).forEach(err => handlers.onLog(`  ${err}`));
+        handlers.onLog(`  ... và ${errors.length - 3} lỗi khác`);
+      }
     }
   }
 
   return $doc.html();
 }
+
 
 async function cleanupTempImages(tempDir) {
   try { await fs.remove(tempDir); } catch { /* ignore */ }
@@ -1036,7 +1084,7 @@ function buildChapterTextContent($, contentRoot, volumeTitle, chapterTitle, page
   return textContent;
 }
 
-async function generateEpub(epubPath, title, author, coverUrl, chapters) {
+async function generateEpub(epubPath, title, author, coverUrl, chapters, tempDir) {
   const options = {
     title,
     author,
@@ -1051,6 +1099,7 @@ async function generateEpub(epubPath, title, author, coverUrl, chapters) {
     const buffer = await EpubGen(options, chapters);
     await fs.writeFile(epubPath, buffer);
   } catch (error) {
+    // If EPUB generation fails, try without images
     for (const chapter of chapters) {
       const $chapter = cheerio.load(chapter.content);
       $chapter('img').remove();
@@ -1399,7 +1448,7 @@ function resolveSelectedVolumeIndexes(volumes, selectedVolumeIndexes) {
   return [...new Set(indexes)];
 }
 
-async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeInput, handlers = {}) {
+async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeInput, customTitle = '', useVolumeCover = {}, handlers = {}) {
   const selectedVolumeIndexes = resolveSelectedVolumeIndexes(novel.volumes, selectedVolumeIndexesInput);
   const epubMode = ensureValidEpubMode(epubModeInput);
 
@@ -1412,7 +1461,10 @@ async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeIn
     0
   );
 
-  const safeTitle = sanitizeFileName(novel.title);
+  // Use custom title if provided, otherwise use original title
+  const finalTitle = customTitle.trim() || novel.title;
+  const safeTitle = sanitizeFileName(finalTitle);
+  console.log('[DEBUG] customTitle:', customTitle, '| finalTitle:', finalTitle, '| safeTitle:', safeTitle);
   const novelDir = path.join(DOWNLOADS_DIR, safeTitle);
   await fs.ensureDir(novelDir);
 
@@ -1473,7 +1525,8 @@ async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeIn
     allEpubChapters.push(...chapters);
     perVolumeChapters[volumeIndex] = {
       safeVolumeTitle,
-      chapters
+      chapters,
+      tempDir
     };
     tempImageDirs.push(tempDir);
   }
@@ -1487,7 +1540,9 @@ async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeIn
   if (epubMode === '1' || epubMode === '3') {
     const epubPath = path.join(novelDir, `${safeTitle}.epub`);
     handlers.onLog?.('Đang đóng gói EPUB tổng...');
-    await generateEpub(epubPath, novel.title, novel.author, novel.coverUrl, [...allEpubChapters]);
+    // Use first volume's tempDir for images
+    const firstTempDir = tempImageDirs.length > 0 ? tempImageDirs[0] : null;
+    await generateEpub(epubPath, finalTitle, novel.author, novel.coverUrl, [...allEpubChapters], firstTempDir);
     generatedEpubs.push(epubPath);
   }
 
@@ -1496,14 +1551,21 @@ async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeIn
       const record = perVolumeChapters[volumeIndex];
       if (!record || record.chapters.length === 0) continue;
 
-      const epubPath = path.join(novelDir, `${record.safeVolumeTitle}.epub`);
+      const volume = novel.volumes[volumeIndex];
+      const epubPath = path.join(novelDir, `${safeTitle} - ${record.safeVolumeTitle}.epub`);
       handlers.onLog?.(`Đang đóng gói EPUB ${record.safeVolumeTitle}...`);
+
+      // Use volume cover if checkbox is checked and volume has cover, otherwise use novel cover
+      const shouldUseVolumeCover = useVolumeCover[volumeIndex] !== false; // default true
+      const volumeCover = (shouldUseVolumeCover && volume.coverUrl) ? volume.coverUrl : novel.coverUrl;
+
       await generateEpub(
         epubPath,
-        `${novel.title} - ${novel.volumes[volumeIndex].title}`,
+        `${finalTitle} - ${volume.title}`,
         novel.author,
-        novel.coverUrl,
-        [...record.chapters]
+        volumeCover,
+        [...record.chapters],
+        record.tempDir
       );
       generatedEpubs.push(epubPath);
     }
@@ -1513,10 +1575,8 @@ async function downloadNovelAssets(novel, selectedVolumeIndexesInput, epubModeIn
     await cleanupIntermediateChapterFiles(volumeDirs, handlers);
   }
 
-  // Clean up temp image files after EPUB generation
-  for (const dir of tempImageDirs) {
-    await cleanupTempImages(dir);
-  }
+  // Keep temp image directories for debugging - DO NOT DELETE
+  handlers.onLog?.(`Thư mục ảnh: ${tempImageDirs.join(', ')}`);
 
   return {
     mode: 'single',
@@ -1622,7 +1682,8 @@ async function performDownload(taskId, payload) {
     allEpubChapters.push(...chapters);
     perVolumeChapters[volumeIndex] = {
       safeVolumeTitle,
-      chapters
+      chapters,
+      tempDir
     };
     tempImageDirs.push(tempDir);
   }
@@ -1632,7 +1693,8 @@ async function performDownload(taskId, payload) {
   if (epubMode === '1' || epubMode === '3') {
     const epubPath = path.join(DOWNLOADS_DIR, `${safeTitle}.epub`);
     pushTaskLog(taskId, 'Đang đóng gói EPUB tổng...');
-    await generateEpub(epubPath, novel.title, novel.author, novel.coverUrl, [...allEpubChapters]);
+    const firstTempDir = tempImageDirs.length > 0 ? tempImageDirs[0] : null;
+    await generateEpub(epubPath, novel.title, novel.author, novel.coverUrl, [...allEpubChapters], firstTempDir);
     generatedEpubs.push(epubPath);
   }
 
@@ -1648,16 +1710,14 @@ async function performDownload(taskId, payload) {
         `${novel.title} - ${novel.volumes[volumeIndex].title}`,
         novel.author,
         novel.coverUrl,
-        [...record.chapters]
+        [...record.chapters],
+        record.tempDir
       );
       generatedEpubs.push(epubPath);
     }
   }
 
-  // Clean up temp image files after EPUB generation
-  for (const dir of tempImageDirs) {
-    await cleanupTempImages(dir);
-  }
+  // Keep temp image directories for debugging - DO NOT DELETE
 
   updateTask(taskId, {
         status: 'completed',
@@ -1703,18 +1763,26 @@ async function performDownload(taskId, payload) {
 
   pushTaskLog(taskId, 'Đang lấy thông tin truyện...');
 
+  console.log('[DEBUG] payload.customTitle:', payload.customTitle);
+
   const novel = await fetchNovelInfo(payload.url);
-  const result = await downloadNovelAssets(novel, payload.selectedVolumeIndexes, payload.epubMode, {
-    onStart: ({ selectedVolumeIndexes, epubMode }) => {
-      updateTask(taskId, {
-        payload: {
-          ...payload,
-          selectedVolumeIndexes,
-          epubMode,
-          novelTitle: novel.title
-        }
-      });
-    },
+  const result = await downloadNovelAssets(
+    novel,
+    payload.selectedVolumeIndexes,
+    payload.epubMode,
+    payload.customTitle || '',
+    payload.useVolumeCover || {},
+    {
+      onStart: ({ selectedVolumeIndexes, epubMode }) => {
+        updateTask(taskId, {
+          payload: {
+            ...payload,
+            selectedVolumeIndexes,
+            epubMode,
+            novelTitle: novel.title
+          }
+        });
+      },
     onChapterStart: ({ chapter, chapterIndex, volumeChapterCount }) => {
       pushTaskLog(
         taskId,
@@ -2121,7 +2189,9 @@ app.post('/api/download', (req, res) => {
   const task = startDownloadTask({
     url,
     epubMode: ensureValidEpubMode(String(req.body?.epubMode || '1')),
-    selectedVolumeIndexes: parseSelectedVolumeIndexes(req.body || {})
+    selectedVolumeIndexes: parseSelectedVolumeIndexes(req.body || {}),
+    customTitle: req.body?.customTitle || '',
+    useVolumeCover: req.body?.useVolumeCover || {}
   });
 
   res.status(202).json({ task: serializeTask(task) });
