@@ -53,6 +53,7 @@ const elements = {
   novelSummary: document.querySelector('#novelSummary'),
   selectionSummary: document.querySelector('#selectionSummary'),
   epubModeSelect: document.querySelector('#epubModeSelect'),
+  customTitleInput: document.querySelector('#customTitleInput'),
   selectAllVolumesBtn: document.querySelector('#selectAllVolumesBtn'),
   clearVolumesBtn: document.querySelector('#clearVolumesBtn'),
   downloadBtn: document.querySelector('#downloadBtn'),
@@ -294,14 +295,25 @@ function renderNovelDetail(novel) {
       .map(chapter => `<li>${escapeHtml(chapter.title)}</li>`)
       .join('');
     const hiddenCount = Math.max(0, volume.chapters.length - 5);
+    const volumeCoverSrc = getCoverSource(volume.coverUrl);
+    const hasVolumeCover = volume.coverUrl && volume.coverUrl.trim() !== '';
 
     return `
       <label class="volume-card">
         <div class="volume-card-main">
+          <div class="volume-cover-thumb">
+            <img src="${volumeCoverSrc}" alt="Cover tập ${index + 1}">
+          </div>
           <div class="volume-copy">
             <span class="volume-index">Tập ${String(index + 1).padStart(2, '0')}</span>
             <h4>${escapeHtml(volume.title)}</h4>
             <p class="volume-note">${volume.chapters.length} chương có thể tải</p>
+            ${hasVolumeCover ? `
+              <label class="volume-cover-option" onclick="event.stopPropagation()">
+                <input type="checkbox" class="use-volume-cover-checkbox" value="${index}" checked>
+                <span>Dùng cover tập này</span>
+              </label>
+            ` : ''}
           </div>
           <input type="checkbox" class="volume-checkbox" value="${index}" checked>
         </div>
@@ -684,12 +696,25 @@ async function startDownload() {
     return;
   }
 
+  // Get which volumes should use their own cover
+  const useVolumeCover = {};
+  document.querySelectorAll('.use-volume-cover-checkbox').forEach(checkbox => {
+    const volumeIndex = Number.parseInt(checkbox.value, 10);
+    useVolumeCover[volumeIndex] = checkbox.checked;
+  });
+
+  const customTitle = elements.customTitleInput?.value.trim() || '';
+  console.log('[DEBUG] customTitleInput element:', elements.customTitleInput);
+  console.log('[DEBUG] Custom title:', customTitle);
+
   const data = await api('/api/download', {
     method: 'POST',
     body: JSON.stringify({
       url: state.currentNovel.sourceUrl,
       selectedVolumeIndexes,
-      epubMode: elements.epubModeSelect.value
+      epubMode: elements.epubModeSelect.value,
+      customTitle,
+      useVolumeCover
     })
   });
 
