@@ -1,4 +1,7 @@
 node_modules/
+.docln-cookies.json
+.docln-cookie.jar
+logs/
 downloads/
 output/
 .playwright-cli/

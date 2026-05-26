@@ -16,6 +16,11 @@ const COVER_PLACEHOLDER = 'data:image/svg+xml;charset=UTF-8,' + encodeURICompone
   </svg>
 `);
 
+const DOCLN_ORIGINS = new Set([
+  'https://docln.net',
+  'https://docln.sbs'
+]);
+
 const state = {
   currentNovel: null,
   currentResults: [],
@@ -23,12 +28,27 @@ const state = {
   currentTaskId: null,
   taskPollTimer: null,
   dnsProfiles: [],
-  currentSiteOrigin: ''
+  currentSiteOrigin: '',
+  doclnCookies: {
+    configured: false,
+    keys: [],
+    hasCloudflare: false,
+    hasSession: false
+  }
 };
 
 const elements = {
   siteStatus: document.querySelector('#siteStatus'),
   dnsStatus: document.querySelector('#dnsStatus'),
+  cookieStatusBtn: document.querySelector('#cookieStatusBtn'),
+  cookieDialog: document.querySelector('#cookieDialog'),
+  cookieDialogForm: document.querySelector('#cookieDialogForm'),
+  cookieInput: document.querySelector('#cookieInput'),
+  cookieMeta: document.querySelector('#cookieMeta'),
+  closeCookieDialogBtn: document.querySelector('#closeCookieDialogBtn'),
+  testCookieBtn: document.querySelector('#testCookieBtn'),
+  clearCookieBtn: document.querySelector('#clearCookieBtn'),
+  saveCookieBtn: document.querySelector('#saveCookieBtn'),
   loadRecommendationsBtn: document.querySelector('#loadRecommendationsBtn'),
   searchForm: document.querySelector('#searchForm'),
   searchInput: document.querySelector('#searchInput'),
@@ -110,6 +130,86 @@ function isValvrareSite() {
   return state.currentSiteOrigin === 'https://valvrareteam.net';
 }
 
+function isDoclnSite(origin = state.currentSiteOrigin) {
+  return DOCLN_ORIGINS.has(origin);
+}
+
+function formatCookieStatusLabel(status = state.doclnCookies) {
+  if (!status?.configured) {
+    return 'Cookie: Chưa có';
+  }
+
+  if (!status.hasCloudflare || !status.hasSession) {
+    return 'Cookie: Thiếu key';
+  }
+
+  return 'Cookie: Đã lưu';
+}
+
+function renderCookieStatus(status = state.doclnCookies) {
+  if (!elements.cookieStatusBtn) return;
+
+  state.doclnCookies = status || state.doclnCookies;
+  elements.cookieStatusBtn.textContent = formatCookieStatusLabel(state.doclnCookies);
+
+  if (!state.doclnCookies.configured) {
+    elements.cookieStatusBtn.dataset.state = 'warn';
+    return;
+  }
+
+  if (state.doclnCookies.hasCloudflare && state.doclnCookies.hasSession) {
+    elements.cookieStatusBtn.dataset.state = 'ok';
+    return;
+  }
+
+  elements.cookieStatusBtn.dataset.state = 'error';
+}
+
+function renderCookieMeta(status = state.doclnCookies, testResult = null, testError = '') {
+  if (!elements.cookieMeta) return;
+
+  elements.cookieMeta.classList.remove('ok', 'error');
+
+  if (!status?.configured) {
+    elements.cookieMeta.textContent = 'Chưa có cookie đã lưu. Dán cookie rồi bấm Lưu Cookie.';
+    return;
+  }
+
+  const keyList = (status.keys || []).slice(0, 8).join(', ');
+  const extraKeys = Math.max(0, (status.keys || []).length - 8);
+  const updatedAt = status.updatedAt
+    ? new Date(status.updatedAt).toLocaleString('vi-VN')
+    : 'không rõ';
+  const lines = [
+    `Đã lưu 2 key cần thiết: ${keyList || 'chưa đủ'}.`,
+    `Cập nhật: ${updatedAt}.`,
+    `cf_clearance: ${status.hasCloudflare ? 'có' : 'thiếu'} | ln_session: ${status.hasSession ? 'có' : 'thiếu'}.`
+  ];
+
+  if (testResult) {
+    lines.push(
+      testResult.ok
+        ? `Kiểm tra OK (HTTP ${testResult.status}).`
+        : `Kiểm tra thất bại (HTTP ${testResult.status}${testResult.blocked ? ', bị Cloudflare chặn' : ''}).`
+    );
+    elements.cookieMeta.classList.add(testResult.ok ? 'ok' : 'error');
+  } else if (testError) {
+    lines.push(`Đã lưu nhưng chưa kiểm tra được: ${testError}`);
+  }
+
+  elements.cookieMeta.textContent = lines.join(' ');
+}
+
+function openCookieDialog() {
+  if (!elements.cookieDialog?.showModal) return;
+  renderCookieMeta(state.doclnCookies);
+  elements.cookieDialog.showModal();
+}
+
+function closeCookieDialog() {
+  elements.cookieDialog?.close();
+}
+
 function updatePrimaryActionLabel() {
   elements.loadRecommendationsBtn.textContent = isValvrareSite()
     ? 'Crawl Danh Mục'
@@ -181,6 +281,7 @@ function setStatus(status) {
   state.currentSiteOrigin = status.site || '';
   elements.siteStatus.textContent = `Trang: ${status.site || '...'}`;
   elements.dnsStatus.textContent = `DNS: ${status.dns || '...'}`;
+  renderCookieStatus(status.doclnCookies);
   updatePrimaryActionLabel();
   updateCatalogDownloadButtonState();
 }
@@ -560,6 +661,63 @@ async function loadStatus() {
   setStatus(status);
 }
 
+async function loadDoclnCookieStatus() {
+  const data = await api('/api/docln-cookies');
+  renderCookieStatus(data.status);
+  renderCookieMeta(data.status);
+  return data.status;
+}
+
+async function saveDoclnCookies() {
+  const rawInput = elements.cookieInput.value.trim();
+  if (!rawInput) {
+    elements.cookieMeta.textContent = 'Hãy dán cookie hoặc lệnh curl trước khi lưu.';
+    elements.cookieMeta.classList.add('error');
+    return;
+  }
+
+  elements.saveCookieBtn.disabled = true;
+  elements.cookieMeta.textContent = 'Đang lưu và kiểm tra cookie...';
+  elements.cookieMeta.classList.remove('ok', 'error');
+
+  try {
+    const data = await api('/api/docln-cookies', {
+      method: 'POST',
+      body: JSON.stringify({ cookie: rawInput })
+    });
+
+    renderCookieStatus(data.status);
+    renderCookieMeta(data.status, data.test, data.testError || '');
+    elements.cookieInput.value = '';
+  } finally {
+    elements.saveCookieBtn.disabled = false;
+  }
+}
+
+async function testDoclnCookies() {
+  elements.testCookieBtn.disabled = true;
+  elements.cookieMeta.textContent = 'Đang kiểm tra cookie với docln.net...';
+  elements.cookieMeta.classList.remove('ok', 'error');
+
+  try {
+    const data = await api('/api/docln-cookies/test', { method: 'POST' });
+    renderCookieStatus(data.status);
+    renderCookieMeta(data.status, data.test);
+  } finally {
+    elements.testCookieBtn.disabled = false;
+  }
+}
+
+async function clearDoclnCookies() {
+  const confirmed = window.confirm('Xóa cookie docln.net đã lưu?');
+  if (!confirmed) return;
+
+  const data = await api('/api/docln-cookies', { method: 'DELETE' });
+  elements.cookieInput.value = '';
+  renderCookieStatus(data.status);
+  renderCookieMeta(data.status);
+}
+
 async function loadDnsProfiles() {
   const data = await api('/api/dns-profiles');
   state.dnsProfiles = data.profiles;
@@ -799,11 +957,44 @@ function bindEvents() {
   elements.downloadBtn.addEventListener('click', () => {
     startDownload().catch(showInlineError);
   });
+
+  elements.cookieStatusBtn?.addEventListener('click', () => {
+    openCookieDialog();
+  });
+
+  elements.closeCookieDialogBtn?.addEventListener('click', () => {
+    closeCookieDialog();
+  });
+
+  elements.cookieDialog?.addEventListener('click', event => {
+    if (event.target === elements.cookieDialog) {
+      closeCookieDialog();
+    }
+  });
+
+  elements.cookieDialogForm?.addEventListener('submit', event => {
+    event.preventDefault();
+    saveDoclnCookies().catch(showInlineError);
+  });
+
+  elements.testCookieBtn?.addEventListener('click', () => {
+    testDoclnCookies().catch(showInlineError);
+  });
+
+  elements.clearCookieBtn?.addEventListener('click', () => {
+    clearDoclnCookies().catch(showInlineError);
+  });
 }
 
 function showInlineError(error) {
-  elements.taskSummary.textContent = error.message || String(error);
+  const message = error.message || String(error);
+  elements.taskSummary.textContent = message;
   elements.taskSummary.classList.add('error-text');
+
+  if (isDoclnSite() && /403|cookie|cloudflare|forbidden/i.test(message)) {
+    openCookieDialog();
+  }
+
   setTimeout(() => {
     elements.taskSummary.classList.remove('error-text');
   }, 2500);
@@ -817,6 +1008,14 @@ async function bootstrap() {
   syncEpubModeSelects(elements.batchEpubModeSelect || elements.epubModeSelect);
   await loadStatus();
   await loadDnsProfiles();
+  await loadDoclnCookieStatus().catch(() => {});
+
+  if (isDoclnSite() && !state.doclnCookies.configured) {
+    openCookieDialog();
+    elements.resultsList.innerHTML = '<p class="error-text">Cần cấu hình cookie docln.net. Bấm nút Cookie ở góc trên để dán cookie.</p>';
+    return;
+  }
+
   await loadRecommendations();
 }
 

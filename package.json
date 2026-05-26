@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "stop": "sh -c 'kill $(lsof -t -i:${PORT:-3000}) 2>/dev/null || true'",
+    "logs": "tail -f logs/server.log",
     "cli": "node index.js",
     "web": "node server.js"
   },

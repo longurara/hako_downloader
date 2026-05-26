@@ -20,6 +20,9 @@
         <div class="status-strip">
           <span id="siteStatus" class="status-chip">Site: ...</span>
           <span id="dnsStatus" class="status-chip">DNS: ...</span>
+          <button id="cookieStatusBtn" type="button" class="status-chip status-chip-button" title="Cấu hình cookie docln.net">
+            Cookie: ...
+          </button>
         </div>
       </div>
     </header>
@@ -180,6 +183,46 @@
       </section>
     </main>
   </div>
+
+  <dialog id="cookieDialog" class="cookie-dialog">
+    <form id="cookieDialogForm" method="dialog" class="cookie-dialog-panel">
+      <div class="cookie-dialog-head">
+        <div>
+          <p class="eyebrow">docln.net</p>
+          <h2>Cấu Hình Cookie</h2>
+          <p class="cookie-dialog-lead">
+            Trang docln.net yêu cầu cookie đăng nhập và Cloudflare. Dán cookie từ trình duyệt hoặc từ lệnh curl.
+          </p>
+        </div>
+        <button type="button" id="closeCookieDialogBtn" class="ghost-button" aria-label="Đóng">Đóng</button>
+      </div>
+
+      <section class="cookie-guide">
+        <h3>Cách lấy cookie</h3>
+        <ol>
+          <li>Mở <a href="https://docln.net/" target="_blank" rel="noreferrer">docln.net</a> và đăng nhập tài khoản.</li>
+          <li>Nhấn <strong>F12</strong> để mở DevTools, chọn tab <strong>Mạng / Network</strong>.</li>
+          <li>Tải lại trang (F5), bấm một request tới <code>docln.net</code>.</li>
+          <li>Trong <strong>Headers</strong>, tìm dòng <code>Cookie:</code> và copy toàn bộ giá trị.</li>
+          <li>Hoặc chuột phải request → <strong>Copy</strong> → <strong>Copy as cURL</strong>, rồi dán vào ô bên dưới.</li>
+        </ol>
+        <p class="cookie-guide-note">
+          Chỉ cần dán <strong>một dòng</strong> Cookie từ trình duyệt. App tự giữ 2 key bắt buộc: <code>cf_clearance</code> (Cloudflare) và <code>ln_session</code> (đăng nhập). Các key khác (XSRF, remember_web…) sẽ bỏ qua.
+        </p>
+      </section>
+
+      <label for="cookieInput">Cookie hoặc lệnh curl</label>
+      <textarea id="cookieInput" rows="7" placeholder="Dán Cookie: ... hoặc toàn bộ lệnh curl -H 'Cookie: ...'"></textarea>
+
+      <div id="cookieMeta" class="cookie-meta">Chưa có cookie đã lưu.</div>
+
+      <div class="cookie-dialog-actions">
+        <button type="button" id="testCookieBtn" class="ghost-button">Kiểm Tra</button>
+        <button type="button" id="clearCookieBtn" class="ghost-button">Xóa Cookie</button>
+        <button type="submit" id="saveCookieBtn">Lưu Cookie</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/app.js" defer></script>
 </body>

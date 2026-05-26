@@ -1,5 +1,6 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
+const { execFile } = require('child_process');
 const dns = require('dns');
 const express = require('express');
 const fs = require('fs-extra');
@@ -8,19 +9,34 @@ const https = require('https');
 const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 const EpubGen = require('epub-gen-memory').default;
 
 const app = express();
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+const LOG_DIR = path.join(__dirname, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'server.log');
+const DOCLN_COOKIE_FILE = path.join(__dirname, '.docln-cookies.json');
+const DOCLN_COOKIE_JAR_FILE = path.join(__dirname, '.docln-cookie.jar');
+const DOCLN_PRIMARY_ORIGIN = 'https://docln.net';
 const VALVRARE_ORIGIN = 'https://valvrareteam.net';
+const DOCLN_ORIGINS = new Set([
+  DOCLN_PRIMARY_ORIGIN,
+  'https://docln.sbs'
+]);
 const VALVRARE_DIRECTORY_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'vi,en-US;q=0.9,en;q=0.8',
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:139.0) Gecko/20100101 Firefox/139.0',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
   Referer: 'https://docln.net/'
 };
+
+const DOCLN_FETCH_MODE = process.env.DOCLN_FETCH_MODE || 'curl';
+const DOCLN_ESSENTIAL_COOKIE_NAMES = ['cf_clearance', 'ln_session'];
 
 const SITE_ORIGINS = [
   'https://docln.net',
@@ -56,18 +72,98 @@ const NAV_TEXT_BLACKLIST = new Set([
   'truyen vua doc'
 ]);
 
-let activeOrigin = SITE_ORIGINS[0];
+let activeOrigin = DOCLN_PRIMARY_ORIGIN;
 let dnsProfile = createDnsProfile(DNS_PROFILES.system.label, DNS_PROFILES.system.servers, DNS_PROFILES.system.id);
 let httpClient;
 let valvrareDirectoryCache = null;
+let doclnCookieStore = {
+  cookie: '',
+  updatedAt: null
+};
 
 const tasks = new Map();
 
+loadDoclnCookiesFromDisk();
 applyDnsProfile(DNS_PROFILES.system);
+setupProcessLogging();
 
 app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+    logLine(`[http] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs}ms)`);
+  });
+  next();
+});
 app.use('/downloads', express.static(DOWNLOADS_DIR));
 app.use(express.static(path.join(__dirname, 'public')));
+
+function logLine(message) {
+  console.log(message);
+}
+
+function logError(message) {
+  console.error(message);
+}
+
+function setupProcessLogging() {
+  fs.ensureDirSync(LOG_DIR);
+
+  const writeLog = (level, args) => {
+    const text = args.map(value => {
+      if (typeof value === 'string') return value;
+      if (value instanceof Error) return value.stack || value.message;
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    }).join(' ');
+
+    fs.appendFile(
+      LOG_FILE,
+      `[${new Date().toISOString()}] [${level}] ${text}\n`
+    ).catch(() => {});
+  };
+
+  const originalLog = console.log.bind(console);
+  const originalError = console.error.bind(console);
+
+  console.log = (...args) => {
+    originalLog(...args);
+    writeLog('info', args);
+  };
+
+  console.error = (...args) => {
+    originalError(...args);
+    writeLog('error', args);
+  };
+
+  process.on('unhandledRejection', error => {
+    logError(`[fatal] unhandledRejection: ${formatErrorMessage(error)}`);
+  });
+
+  process.on('uncaughtException', error => {
+    logError(`[fatal] uncaughtException: ${formatErrorMessage(error)}`);
+  });
+}
+
+function keepProcessAliveForTerminal() {
+  if (process.stdin.isTTY) {
+    process.stdin.resume();
+  }
+
+  process.on('SIGINT', () => {
+    logLine('\n[server] Nhận Ctrl+C — đang dừng server...');
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', () => {
+    logLine('[server] Nhận SIGTERM — đang dừng server...');
+    process.exit(0);
+  });
+}
 
 function createDnsProfile(label, servers, id = 'custom') {
   return {
@@ -192,14 +288,293 @@ function getOrigin(url) {
   }
 }
 
-function buildRequestHeaders(targetUrl) {
-  const targetOrigin = getOrigin(targetUrl);
-  const refererOrigin = isSiteOrigin(targetOrigin) ? targetOrigin : activeOrigin;
+function isDoclnOrigin(origin) {
+  return DOCLN_ORIGINS.has(origin);
+}
+
+function needsDoclnCookies(targetUrl) {
+  return isDoclnOrigin(getOrigin(targetUrl));
+}
+
+function parseCookieNames(cookieHeader) {
+  if (!cookieHeader) return [];
+
+  return cookieHeader
+    .split(';')
+    .map(part => part.trim().split('=')[0])
+    .filter(Boolean);
+}
+
+function isEssentialDoclnCookieName(name) {
+  return DOCLN_ESSENTIAL_COOKIE_NAMES.includes(name);
+}
+
+function filterEssentialDoclnCookies(cookieHeader) {
+  const pairs = parseCookieHeaderPairs(cookieHeader);
+  const essentialPairs = pairs.filter(pair => isEssentialDoclnCookieName(pair.name));
+
+  if (essentialPairs.length === 0) {
+    throw new Error(
+      `Cookie phải có ít nhất cf_clearance và ln_session. Chỉ cần dán 1 dòng Cookie từ trình duyệt — app sẽ tự giữ 2 key này.`
+    );
+  }
+
+  return essentialPairs.map(pair => `${pair.name}=${pair.value}`).join('; ');
+}
+
+function extractCookieFromCurl(curlText) {
+  const normalized = String(curlText || '');
+  const patterns = [
+    /(?:^|\s)(?:-H|--header)\s+['"]Cookie:\s*([^'"]+)['"]/i,
+    /(?:^|\s)(?:-H|--header)\s+['"]cookie:\s*([^'"]+)['"]/i,
+    /(?:^|\s)(?:-b|--cookie)\s+['"]([^'"]+)['"]/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+
+  return '';
+}
+
+function normalizeDoclnCookieInput(rawInput) {
+  const trimmed = normalizeWhitespace(rawInput);
+  if (!trimmed) return '';
+
+  if (/curl\s/i.test(trimmed) || /(?:^|\s)(?:-H|--header)\s/i.test(trimmed)) {
+    return extractCookieFromCurl(trimmed);
+  }
+
+  return trimmed.replace(/^cookie:\s*/i, '');
+}
+
+function parseCookieHeaderPairs(cookieHeader) {
+  return cookieHeader
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => {
+      const separatorIndex = part.indexOf('=');
+      if (separatorIndex <= 0) return null;
+      return {
+        name: part.slice(0, separatorIndex),
+        value: part.slice(separatorIndex + 1)
+      };
+    })
+    .filter(Boolean);
+}
+
+async function writeDoclnCookieJar(cookieHeader, hostname = 'docln.net') {
+  const cookies = parseCookieHeaderPairs(cookieHeader);
+  if (cookies.length === 0) return;
+
+  const expiry = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30;
+  const domain = hostname.startsWith('.') ? hostname : `.${hostname}`;
+  const lines = [
+    '# Netscape HTTP Cookie File',
+    '# Generated by hako-downloader',
+    ''
+  ];
+
+  for (const { name, value } of cookies) {
+    lines.push([domain, 'TRUE', '/', 'FALSE', expiry, name, value].join('\t'));
+  }
+
+  await fs.writeFile(DOCLN_COOKIE_JAR_FILE, `${lines.join('\n')}\n`, 'utf8');
+}
+
+function refreshDoclnCookiesFromDisk() {
+  try {
+    if (!fs.existsSync(DOCLN_COOKIE_FILE)) return;
+
+    const saved = fs.readJsonSync(DOCLN_COOKIE_FILE);
+    const cookie = normalizeDoclnCookieInput(saved.cookie || '');
+    if (!cookie) return;
+
+    const changed = cookie !== doclnCookieStore.cookie
+      || saved.updatedAt !== doclnCookieStore.updatedAt;
+
+    if (!changed) return;
+
+    doclnCookieStore = {
+      cookie: filterEssentialDoclnCookies(cookie),
+      updatedAt: saved.updatedAt || null
+    };
+    writeDoclnCookieJar(doclnCookieStore.cookie, 'docln.net').catch(error => {
+      console.warn(`Không ghi cookie jar: ${error.message}`);
+    });
+  } catch (error) {
+    console.warn(`Không đọc được cookie docln: ${error.message}`);
+  }
+}
+
+function loadDoclnCookiesFromDisk() {
+  try {
+    if (!fs.existsSync(DOCLN_COOKIE_FILE)) return;
+
+    const saved = fs.readJsonSync(DOCLN_COOKIE_FILE);
+    const normalized = normalizeDoclnCookieInput(saved.cookie || '');
+    if (!normalized) return;
+
+    const cookie = filterEssentialDoclnCookies(normalized);
+
+    doclnCookieStore = {
+      cookie,
+      updatedAt: saved.updatedAt || null
+    };
+    writeDoclnCookieJar(cookie, 'docln.net').catch(error => {
+      console.warn(`Không ghi cookie jar: ${error.message}`);
+    });
+
+    if (cookie !== normalized) {
+      persistDoclnCookies().catch(error => {
+        console.warn(`Không ghi lại cookie đã lọc: ${error.message}`);
+      });
+    }
+  } catch (error) {
+    console.warn(`Không đọc được cookie docln: ${error.message}`);
+  }
+}
+
+async function persistDoclnCookies() {
+  if (!doclnCookieStore.cookie) {
+    if (await fs.pathExists(DOCLN_COOKIE_FILE)) {
+      await fs.remove(DOCLN_COOKIE_FILE);
+    }
+    if (await fs.pathExists(DOCLN_COOKIE_JAR_FILE)) {
+      await fs.remove(DOCLN_COOKIE_JAR_FILE);
+    }
+    return;
+  }
+
+  await fs.writeJson(DOCLN_COOKIE_FILE, {
+    cookie: doclnCookieStore.cookie,
+    updatedAt: doclnCookieStore.updatedAt
+  }, { spaces: 2 });
+  await writeDoclnCookieJar(doclnCookieStore.cookie, 'docln.net');
+}
+
+function getDoclnCookieStatus() {
+  const keys = parseCookieNames(doclnCookieStore.cookie);
+  const essentialKeys = keys.filter(isEssentialDoclnCookieName);
 
   return {
+    configured: Boolean(doclnCookieStore.cookie),
+    updatedAt: doclnCookieStore.updatedAt,
+    keys: essentialKeys,
+    essentialKeys,
+    hasCloudflare: essentialKeys.includes('cf_clearance'),
+    hasSession: essentialKeys.includes('ln_session'),
+    isValid: essentialKeys.includes('cf_clearance') && essentialKeys.includes('ln_session')
+  };
+}
+
+function setDoclnCookies(rawInput) {
+  const normalized = normalizeDoclnCookieInput(rawInput);
+  if (!normalized) {
+    throw new Error('Cookie trống hoặc không đọc được từ nội dung đã dán.');
+  }
+
+  const cookie = filterEssentialDoclnCookies(normalized);
+
+  doclnCookieStore = {
+    cookie,
+    updatedAt: new Date().toISOString()
+  };
+  writeDoclnCookieJar(cookie, 'docln.net').catch(() => {});
+
+  return getDoclnCookieStatus();
+}
+
+async function clearDoclnCookies() {
+  doclnCookieStore = {
+    cookie: '',
+    updatedAt: null
+  };
+
+  if (await fs.pathExists(DOCLN_COOKIE_JAR_FILE)) {
+    await fs.remove(DOCLN_COOKIE_JAR_FILE);
+  }
+}
+
+async function testDoclnCookies() {
+  if (!doclnCookieStore.cookie) {
+    throw new Error('Chưa cấu hình cookie docln.net.');
+  }
+
+  const testUrl = `${DOCLN_PRIMARY_ORIGIN}/`;
+  const headers = buildRequestHeaders(testUrl);
+  await writeDoclnCookieJar(doclnCookieStore.cookie, 'docln.net');
+
+  try {
+    const result = await fetchViaCurl(testUrl, headers);
+    const blocked = isCloudflareBlockPage(result.body);
+
+    return {
+      ok: !blocked && result.body.length > 200,
+      status: blocked ? 403 : 200,
+      blocked,
+      finalUrl: result.finalUrl || testUrl,
+      mode: 'curl'
+    };
+  } catch (error) {
+    const response = await httpClient.get(testUrl, {
+      responseType: 'text',
+      headers,
+      validateStatus: () => true
+    });
+    const html = typeof response.data === 'string' ? response.data : String(response.data || '');
+    const blocked = response.status === 403 || isCloudflareBlockPage(html);
+
+    return {
+      ok: response.status >= 200 && response.status < 400 && !blocked,
+      status: response.status,
+      blocked,
+      finalUrl: getFinalResponseUrl(response, testUrl),
+      mode: 'axios',
+      fallbackError: formatErrorMessage(error)
+    };
+  }
+}
+
+function buildRequestHeaders(targetUrl) {
+  const targetOrigin = getOrigin(targetUrl);
+  const refererOrigin = isDoclnOrigin(targetOrigin)
+    ? targetOrigin
+    : (isSiteOrigin(targetOrigin) ? targetOrigin : DOCLN_PRIMARY_ORIGIN);
+  const headers = {
     ...HEADERS,
     Referer: `${refererOrigin}/`
   };
+
+  if (needsDoclnCookies(targetUrl) && doclnCookieStore.cookie) {
+    headers.Cookie = doclnCookieStore.cookie;
+  }
+
+  return headers;
+}
+
+function updateActiveOrigin(finalUrl) {
+  const finalOrigin = getOrigin(finalUrl);
+  if (isSiteOrigin(finalOrigin)) {
+    activeOrigin = finalOrigin;
+  }
+}
+
+function isCloudflareBlockPage(html) {
+  if (!html || html.length < 120) return true;
+  if (/series-name|volume-list|rd-novel-title|module-chapter-item|list-chapters|danh-sach-chuong/i.test(html)) {
+    return false;
+  }
+
+  const sniff = html.slice(0, 12000).toLowerCase();
+  return sniff.includes('<title>just a moment')
+    || sniff.includes('cf-browser-verification')
+    || sniff.includes('checking if the site connection is secure')
+    || (sniff.includes('challenge-platform') && sniff.includes('window._cf_chl_opt'));
 }
 
 function isSiteOrigin(origin) {
@@ -336,10 +711,186 @@ function createHttpClient(lookup) {
     headers: HEADERS,
     timeout: 30000,
     maxRedirects: 5,
-    httpAgent: new http.Agent({ lookup }),
-    httpsAgent: new https.Agent({ lookup }),
+    httpAgent: new http.Agent({ lookup, family: 4 }),
+    httpsAgent: new https.Agent({ lookup, family: 4, minVersion: 'TLSv1.2' }),
     validateStatus: status => status >= 200 && status < 400
   });
+}
+
+function shouldFetchDoclnViaCurl(targetUrl) {
+  return needsDoclnCookies(targetUrl) && DOCLN_FETCH_MODE !== 'axios';
+}
+
+function buildCurlArgs(url, headers, options = {}) {
+  const args = [
+    '-sSL',
+    '--compressed',
+    '--ipv4',
+    '--tlsv1.2',
+    '--http1.1',
+    '--max-time',
+    String(options.timeoutSeconds || 45),
+    '-A',
+    headers['User-Agent'] || HEADERS['User-Agent'],
+    '-H',
+    `Accept: ${headers.Accept || HEADERS.Accept}`,
+    '-H',
+    `Accept-Language: ${headers['Accept-Language'] || HEADERS['Accept-Language']}`
+  ];
+
+  if (needsDoclnCookies(url) && doclnCookieStore.cookie && fs.existsSync(DOCLN_COOKIE_JAR_FILE)) {
+    args.push('-b', DOCLN_COOKIE_JAR_FILE);
+  } else if (headers.Cookie) {
+    args.push('-H', `Cookie: ${headers.Cookie}`);
+  }
+
+  if (headers.Referer) {
+    args.push('-H', `Referer: ${headers.Referer}`);
+  }
+
+  if (options.includeEffectiveUrl) {
+    args.push('-w', '\n__CURL_EFFECTIVE_URL__:%{url_effective}');
+  }
+
+  args.push(url);
+  return args;
+}
+
+function splitCurlResponse(rawOutput) {
+  const marker = '\n__CURL_EFFECTIVE_URL__:';
+  const markerIndex = rawOutput.lastIndexOf(marker);
+
+  if (markerIndex === -1) {
+    return { body: rawOutput, finalUrl: '' };
+  }
+
+  return {
+    body: rawOutput.slice(0, markerIndex),
+    finalUrl: rawOutput.slice(markerIndex + marker.length).trim()
+  };
+}
+
+function isRecoverableFetchError(error) {
+  const message = formatErrorMessage(error).toLowerCase();
+  return /tls|socket disconnected|econnreset|etimedout|ssl|certificate|epipe|enotfound|eai_again|403|cloudflare|cookie|curl/i.test(message);
+}
+
+function formatCurlExecError(error) {
+  const stderr = error?.stderr ? String(error.stderr).trim() : '';
+  if (stderr) return stderr.split('\n').pop();
+  return formatErrorMessage(error);
+}
+
+async function fetchViaCurl(url, headers, options = {}) {
+  const args = buildCurlArgs(url, headers, {
+    timeoutSeconds: options.timeoutSeconds || 45,
+    includeEffectiveUrl: true
+  });
+
+  const { stdout } = await execFileAsync('curl', args, {
+    maxBuffer: options.maxBuffer || 15 * 1024 * 1024,
+    encoding: 'utf8'
+  });
+
+  const { body, finalUrl } = splitCurlResponse(stdout);
+  if (!body || body.length < 120) {
+    throw new Error('curl trả về nội dung quá ngắn hoặc rỗng.');
+  }
+
+  if (isCloudflareBlockPage(body)) {
+    const host = getOrigin(url);
+    throw new Error(`${host} trả về trang Cloudflare. Hãy mở ${host} trên trình duyệt, lấy cookie mới và lưu lại.`);
+  }
+
+  return {
+    body,
+    finalUrl: finalUrl || url
+  };
+}
+
+async function fetchBinaryViaCurl(url, headers, options = {}) {
+  const args = buildCurlArgs(url, headers, {
+    timeoutSeconds: options.timeoutSeconds || 30
+  });
+
+  const { stdout } = await execFileAsync('curl', args, {
+    maxBuffer: options.maxBuffer || 12 * 1024 * 1024,
+    encoding: 'buffer'
+  });
+
+  if (!stdout || stdout.length < 100) {
+    throw new Error(`curl tải nhị phân thất bại (${stdout?.length || 0} bytes).`);
+  }
+
+  return stdout;
+}
+
+async function fetchPageContent(url) {
+  refreshDoclnCookiesFromDisk();
+  const headers = buildRequestHeaders(url);
+  const errors = [];
+
+  if (needsDoclnCookies(url) && doclnCookieStore.cookie) {
+    const hostname = new URL(url).hostname;
+    await writeDoclnCookieJar(doclnCookieStore.cookie, hostname);
+  }
+
+  if (needsDoclnCookies(url) && !doclnCookieStore.cookie) {
+    throw new Error('docln.net yêu cầu cookie. Hãy mở Cấu Hình Cookie và dán cookie từ trình duyệt.');
+  }
+
+  if (shouldFetchDoclnViaCurl(url)) {
+    try {
+      console.log(`[fetch] curl ${url}`);
+      const curlResult = await fetchViaCurl(url, headers);
+      return {
+        html: curlResult.body,
+        finalUrl: curlResult.finalUrl || url
+      };
+    } catch (error) {
+      errors.push(error);
+      console.error(`[fetch] curl lỗi ${url}: ${formatCurlExecError(error)}`);
+    }
+  }
+
+  try {
+    console.log(`[fetch] axios ${url}`);
+    const response = await httpClient.get(url, {
+      responseType: 'text',
+      headers
+    });
+    const html = typeof response.data === 'string' ? response.data : String(response.data);
+
+    return {
+      html,
+      finalUrl: getFinalResponseUrl(response, url)
+    };
+  } catch (error) {
+    errors.push(error);
+    console.error(`[fetch] axios lỗi ${url}: ${formatErrorMessage(error)}`);
+  }
+
+  const combinedMessage = errors
+    .map(error => formatCurlExecError(error))
+    .filter(Boolean)
+    .join(' | ');
+
+  throw new Error(combinedMessage || `Không thể tải trang: ${url}`);
+}
+
+async function fetchBinaryContent(url, headers = buildRequestHeaders(url)) {
+  if (shouldFetchDoclnViaCurl(url)) {
+    return fetchBinaryViaCurl(url, headers);
+  }
+
+  const response = await httpClient.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 20000,
+    headers,
+    maxRedirects: 10
+  });
+
+  return Buffer.from(response.data);
 }
 
 function applyDnsProfile(profile) {
@@ -351,7 +902,8 @@ function applyDnsProfile(profile) {
 function getStatus() {
   return {
     site: activeOrigin,
-    dns: dnsProfile.label
+    dns: dnsProfile.label,
+    doclnCookies: getDoclnCookieStatus()
   };
 }
 
@@ -587,13 +1139,53 @@ function scoreNovelMatch(title, query) {
   return score;
 }
 
-function buildCandidateUrls(pathOrUrl) {
-  if (/^https?:\/\//i.test(pathOrUrl)) {
-    return [pathOrUrl];
+function getDoclnMirrorOrigin(origin) {
+  return origin === DOCLN_PRIMARY_ORIGIN ? 'https://docln.sbs' : DOCLN_PRIMARY_ORIGIN;
+}
+
+function toDoclnMirrorUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (!isDoclnOrigin(parsed.origin)) return '';
+    const mirrorOrigin = getDoclnMirrorOrigin(parsed.origin);
+    return `${mirrorOrigin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return '';
+  }
+}
+
+function expandDoclnMirrorCandidates(candidates) {
+  const expanded = [];
+
+  for (const candidateUrl of candidates) {
+    expanded.push(candidateUrl);
+
+    const mirrorUrl = toDoclnMirrorUrl(candidateUrl);
+    if (mirrorUrl && !expanded.includes(mirrorUrl)) {
+      expanded.push(mirrorUrl);
+    }
   }
 
-  const uniqueOrigins = [activeOrigin, ...SITE_ORIGINS.filter(origin => origin !== activeOrigin)];
-  return uniqueOrigins.map(origin => normalizeUrl(pathOrUrl, origin)).filter(Boolean);
+  return expanded;
+}
+
+function buildCandidateUrls(pathOrUrl) {
+  let candidates = [];
+
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    candidates = [pathOrUrl];
+  } else if (typeof pathOrUrl === 'string' && pathOrUrl.startsWith('/')) {
+    candidates = [
+      normalizeUrl(pathOrUrl, DOCLN_PRIMARY_ORIGIN),
+      normalizeUrl(pathOrUrl, 'https://docln.sbs')
+    ].filter(Boolean);
+  } else {
+    const uniqueOrigins = [DOCLN_PRIMARY_ORIGIN, 'https://docln.sbs', activeOrigin, ...SITE_ORIGINS]
+      .filter((origin, index, list) => list.indexOf(origin) === index);
+    candidates = uniqueOrigins.map(origin => normalizeUrl(pathOrUrl, origin)).filter(Boolean);
+  }
+
+  return expandDoclnMirrorCandidates(candidates);
 }
 
 async function fetchHtmlPage(pathOrUrl) {
@@ -602,21 +1194,29 @@ async function fetchHtmlPage(pathOrUrl) {
 
   for (const candidateUrl of candidates) {
     try {
-      const response = await httpClient.get(candidateUrl, {
-        responseType: 'text',
-        headers: buildRequestHeaders(candidateUrl)
-      });
-      const html = typeof response.data === 'string' ? response.data : String(response.data);
-      const finalUrl = getFinalResponseUrl(response, candidateUrl);
-      const finalOrigin = getOrigin(finalUrl);
-      if (isSiteOrigin(finalOrigin)) {
-        activeOrigin = finalOrigin;
-      }
-
-      return { url: finalUrl, html };
+      const page = await fetchPageContent(candidateUrl);
+      updateActiveOrigin(page.finalUrl);
+      return { url: page.finalUrl, html: page.html };
     } catch (error) {
       lastError = error;
+      console.error(`[fetch] lỗi ${candidateUrl}: ${formatErrorMessage(error)}`);
     }
+  }
+
+  const failedOrigin = getOrigin(candidates[0] || pathOrUrl);
+  if (isDoclnOrigin(failedOrigin) && !doclnCookieStore.cookie) {
+    throw new Error('docln.net yêu cầu cookie. Hãy mở Cấu Hình Cookie và dán cookie từ trình duyệt.');
+  }
+
+  if (isDoclnOrigin(failedOrigin) && lastError?.response?.status === 403) {
+    throw new Error('docln.net từ chối truy cập (403). Cookie có thể đã hết hạn — hãy lấy lại và lưu lại.');
+  }
+
+  const combined = formatErrorMessage(lastError);
+  if (isDoclnOrigin(failedOrigin) && /tls|socket disconnected|curl: \(35\)/i.test(combined)) {
+    throw new Error(
+      'Không truy cập được docln.net lẫn docln.sbs. Thử đổi DNS (Cloudflare 1.1.1.1) trong app, hoặc lấy cookie mới từ trang mirror bạn mở được trên trình duyệt.'
+    );
   }
 
   throw lastError || new Error(`Không thể tải trang: ${pathOrUrl}`);
@@ -991,14 +1591,7 @@ async function embedImagesInHtml(contentHtml, pageUrl, tempDir, handlers) {
         'Sec-Fetch-Site': 'cross-site'
       };
 
-      const response = await httpClient.get(imageUrl, {
-        responseType: 'arraybuffer',
-        timeout: 20000,
-        headers: imageHeaders,
-        maxRedirects: 10
-      });
-
-      const buffer = Buffer.from(response.data);
+      const buffer = await fetchBinaryContent(imageUrl, imageHeaders);
 
       if (buffer.length < 100) {
         failed += 1;
@@ -1026,8 +1619,11 @@ async function embedImagesInHtml(contentHtml, pageUrl, tempDir, handlers) {
       const fileUrl = 'file://' + filePath.replace(/\\/g, '/');
       $doc(img).attr('src', fileUrl);
       $doc(img).removeAttr('data-src');
-      // Add width constraint for better display on e-readers
-      $doc(img).attr('style', 'max-width: 100%; height: auto;');
+
+      // Wrap image in a div with page-break to ensure each image gets its own page
+      $doc(img).attr('style', 'max-width: 100%; height: auto; display: block; margin: 0 auto;');
+      $doc(img).wrap('<div style="page-break-before: always; page-break-after: always; text-align: center; padding: 0; margin: 0;"></div>');
+
       embedded += 1;
     } catch (error) {
       failed += 1;
@@ -1130,10 +1726,8 @@ async function downloadChapters(volume, volumeDir, author, handlers = {}) {
       handlers.onLog?.(`[cache] ${chapter.title}`);
     } else {
       try {
-        const chapterResponse = await httpClient.get(chapter.url, {
-          headers: buildRequestHeaders(chapter.url)
-        });
-        let $chapter = cheerio.load(chapterResponse.data);
+        const chapterPage = await fetchPageContent(chapter.url);
+        let $chapter = cheerio.load(chapterPage.html);
         const protectedDiv = $chapter('#chapter-c-protected');
 
         if (protectedDiv.length > 0) {
@@ -2074,6 +2668,58 @@ app.get('/api/dns-profiles', (req, res) => {
   });
 });
 
+app.get('/api/docln-cookies', (req, res) => {
+  res.json({
+    status: getDoclnCookieStatus()
+  });
+});
+
+app.post('/api/docln-cookies', async (req, res) => {
+  const rawInput = req.body?.cookie || req.body?.curl || req.body?.value || '';
+
+  try {
+    const status = setDoclnCookies(rawInput);
+    await persistDoclnCookies();
+
+    let testResult = null;
+    let testError = '';
+
+    try {
+      testResult = await testDoclnCookies();
+    } catch (error) {
+      testError = formatErrorMessage(error);
+    }
+
+    res.json({
+      ok: true,
+      status,
+      test: testResult,
+      testError: testError || undefined
+    });
+  } catch (error) {
+    res.status(400).json({ error: formatErrorMessage(error) });
+  }
+});
+
+app.post('/api/docln-cookies/test', async (req, res) => {
+  try {
+    const testResult = await testDoclnCookies();
+    res.json({
+      ok: testResult.ok,
+      status: getDoclnCookieStatus(),
+      test: testResult
+    });
+  } catch (error) {
+    res.status(400).json({ error: formatErrorMessage(error) });
+  }
+});
+
+app.delete('/api/docln-cookies', async (req, res) => {
+  await clearDoclnCookies();
+  await persistDoclnCookies();
+  res.json({ ok: true, status: getDoclnCookieStatus() });
+});
+
 app.post('/api/dns', (req, res) => {
   const { profileId, servers } = req.body || {};
 
@@ -2158,6 +2804,7 @@ app.get('/api/novel', async (req, res) => {
     const novel = await fetchNovelInfo(url);
     res.json({ novel, status: getStatus() });
   } catch (error) {
+    console.error(`[api/novel] ${url}: ${formatErrorMessage(error)}`);
     res.status(500).json({ error: formatErrorMessage(error) });
   }
 });
@@ -2219,6 +2866,37 @@ app.get('/', (req, res) => {
 
 const port = Number.parseInt(process.env.PORT || '3000', 10);
 
-app.listen(port, () => {
-  console.log(`HAKO web server đang chạy tại http://localhost:${port}`);
+keepProcessAliveForTerminal();
+
+const server = app.listen(port, () => {
+  const cookieStatus = getDoclnCookieStatus();
+  logLine('');
+  logLine(`HAKO web server đang chạy tại http://localhost:${port}`);
+  logLine(`PID ${process.pid} — giữ NGUYÊN tab terminal này để xem log (Ctrl+C để dừng).`);
+  logLine(`Log file: ${LOG_FILE} (xem thêm: npm run logs)`);
+  logLine(
+    cookieStatus.isValid
+      ? `Cookie docln: OK (cf_clearance + ln_session)`
+      : (cookieStatus.configured
+        ? `Cookie docln: thiếu key bắt buộc (cần cf_clearance và ln_session)`
+        : 'Cookie docln: CHƯA có — bấm nút Cookie trên web hoặc POST /api/docln-cookies')
+  );
+  logLine(`Fetch docln: ${DOCLN_FETCH_MODE} | mirror: docln.net → docln.sbs khi .net lỗi TLS`);
+  logLine('');
+});
+
+server.on('error', error => {
+  if (error.code === 'EADDRINUSE') {
+    logError('');
+    logError(`[server] Port ${port} đã có process khác đang dùng.`);
+    logError(`[server] Có thể bạn đã chạy server nền từ lần trước — terminal trả prompt nhưng server vẫn chạy.`);
+    logError(`[server] Dừng server cũ: npm run stop`);
+    logError(`[server] Hoặc: kill $(lsof -t -i:${port})`);
+    logError(`[server] Sau đó chạy lại: npm start`);
+    logError('');
+    process.exit(1);
+  }
+
+  logError(`[server] Không thể khởi động: ${error.message}`);
+  process.exit(1);
 });
