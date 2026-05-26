@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c /home/enterprise/Documents/hako_downloader/server.js)",
+      "Bash(npm install *)",
+      "Bash(npm list *)",
+      "Bash(git add *)"
+    ]
+  }
+}
